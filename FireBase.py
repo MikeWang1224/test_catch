@@ -1,84 +1,197 @@
+# -*- coding: utf-8 -*-
+"""
+整合版：光寶科 LSTM 股價預測 + 5/10 日線繪製
+🔥 功能：
+  - 抓取股價
+  - 計算技術指標
+  - 寫入 Firestore
+  - 訓練 LSTM
+  - 預測未來 10 天
+  - 計算 SMA_5 與 SMA_10
+  - 畫圖顯示
+"""
+
+import os, json
 import firebase_admin
 from firebase_admin import credentials, firestore
 import yfinance as yf
 import pandas as pd
-from datetime import datetime
-import json
-import os
+import numpy as np
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
 
-# 🔐 讀取 Firebase 服務帳戶金鑰（環境變數方式）
+
+# ============================ 🔐 Firebase 初始化 ============================
 key_dict = json.loads(os.environ["FIREBASE"])
 cred = credentials.Certificate(key_dict)
-firebase_admin.initialize_app(cred)
+
+try:
+    firebase_admin.get_app()
+except:
+    firebase_admin.initialize_app(cred)
+
 db = firestore.client()
 
-# 📌 只抓光寶科 (2301.TW)
-ticker_symbol = "2301.TW"
-liteon = yf.Ticker(ticker_symbol)
-df_liteon = liteon.history(period="6mo")   # 可改成 1y, 3mo, max 等
 
-# 📈 計算技術指標
-def calculate_indicators(df):
-    # SMA
+# ============================ 📌 抓股票 + 計算指標 ============================
+def fetch_and_calculate():
+    ticker_symbol = "2301.TW"
+    stock = yf.Ticker(ticker_symbol)
+    df = stock.history(period="6mo")
+
+    # 技術指標計算
     df['SMA_5'] = df['Close'].rolling(window=5).mean().round(5)
     df['SMA_10'] = df['Close'].rolling(window=10).mean().round(5)
-    df['SMA_50'] = df['Close'].rolling(window=50).mean().round(5)
 
-    # RSI
     delta = df['Close'].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(window=20).mean()
-    avg_loss = loss.rolling(window=20).mean()
-    rs = avg_gain / avg_loss
-    df['RSI'] = (100 - (100 / (1 + rs))).round(5)
+    df['RSI'] = (100 - (100 / (1 + (gain.rolling(20).mean() / loss.rolling(20).mean())))).round(5)
 
-    # KD
     df['Lowest_14'] = df['Low'].rolling(window=14).min()
     df['Highest_14'] = df['High'].rolling(window=14).max()
     df['K'] = (100 * (df['Close'] - df['Lowest_14']) / (df['Highest_14'] - df['Lowest_14'])).round(5)
     df['D'] = df['K'].rolling(window=3).mean().round(5)
 
-    # MACD
     df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
     df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = (df['EMA_12'] - df['EMA_26']).round(5)
-    df['SignalLine'] = df['MACD'].ewm(span=9, adjust=False).mean().round(5)
 
     return df
 
-df_liteon = calculate_indicators(df_liteon)
 
-# 🔎 要儲存的欄位
-selected_columns = ['Close', 'MACD', 'RSI', 'K', 'D', 'Volume']
+# ============================ 💾 寫入 Firestore ============================
+def save_to_firestore(df):
+    selected = ['Close', 'MACD', 'RSI', 'K', 'D', 'Volume']
+    collection = "NEW_stock_data_liteon"
 
-# 🔥 Firebase Collection 名稱
-collection_name = "NEW_stock_data_liteon"
-
-# 💾 儲存到 Firestore（以日期為 doc id）
-def save_data():
     batch = db.batch()
     count = 0
-
-    for idx, row in df_liteon.iterrows():
+    for idx, row in df.iterrows():
         date_str = idx.strftime("%Y-%m-%d")
-        data = {col: round(float(row[col]), 5) for col in selected_columns if not pd.isna(row[col])}
-
-        doc_ref = db.collection(collection_name).document(date_str)
+        data = {col: float(row[col]) for col in selected if not pd.isna(row[col])}
+        doc_ref = db.collection(collection).document(date_str)
         batch.set(doc_ref, {"2301.TW": data})
         count += 1
 
-        if count >= 300:  # 批次寫入避免 timeout
+        if count >= 300:
             batch.commit()
-            print(f"批次寫入 {count} 筆")
             batch = db.batch()
-            count = 0
 
-    if count > 0:
-        batch.commit()
-        print(f"剩餘 {count} 筆已寫入")
+    batch.commit()
+    print("🔥 Firestore 寫入完成")
 
-    print(" 🎉 光寶科股票數據已成功寫入 Firestore！")
 
-# ▶️ 執行儲存
-save_data()
+# ============================ 📥 Firestore 讀取 ============================
+def read_from_firestore():
+    docs = db.collection("NEW_stock_data_liteon").stream()
+
+    rows = []
+    for doc in docs:
+        data = doc.to_dict().get("2301.TW", {})
+        data["date"] = doc.id
+        rows.append(data)
+
+    df = pd.DataFrame(rows).sort_values("date")
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
+# ============================ 🤖 建 LSTM 模型 ============================
+def train_lstm(df):
+    features = ['Close', 'Volume', 'MACD', 'RSI', 'K', 'D']
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(df[features])
+
+    X, y = [], []
+    window = 30
+    for i in range(window, len(scaled)):
+        X.append(scaled[i-window:i])
+        y.append(scaled[i][0])
+
+    X, y = np.array(X), np.array(y)
+
+    model = Sequential([
+        LSTM(50, return_sequences=True, input_shape=(X.shape[1], X.shape[2])),
+        Dropout(0.2),
+        LSTM(50),
+        Dropout(0.2),
+        Dense(1)
+    ])
+
+    model.compile(optimizer='adam', loss='mse')
+    model.fit(X, y, epochs=30, batch_size=32, verbose=1)
+    print("🎉 LSTM 訓練完成")
+
+    return model, scaler, scaled
+
+
+# ============================ 🔮 預測未來 10 天 ============================
+def predict_future(model, scaler, scaled, df):
+    last_30 = scaled[-30:]
+    future = []
+
+    for _ in range(10):
+        pred = model.predict(last_30.reshape(1, 30, scaled.shape[1]))
+        future.append(pred[0][0])
+        last_30 = np.append(last_30[1:], pred, axis=0)
+
+    # 逆縮放
+    future_prices = scaler.inverse_transform(
+        np.hstack((np.array(future).reshape(-1, 1),
+                   np.zeros((10, scaled.shape[1]-1))))
+    )[:,0]
+
+    df_future = pd.DataFrame({
+        "date": pd.date_range(df['date'].iloc[-1], periods=11, closed="right"),
+        "Close": future_prices
+    })
+
+    return df_future
+
+
+# ============================ 📈 畫圖 ============================
+# ============================ 📈 畫圖 + 儲存 ============================
+def plot_all(df_real, df_future):
+    df_all = pd.concat([df_real[['date','Close']], df_future])
+    df_all['SMA_5'] = df_all['Close'].rolling(5).mean()
+    df_all['SMA_10'] = df_all['Close'].rolling(10).mean()
+
+    # 建立結果資料夾（若不存在）
+    results_dir = "results"
+    if not os.path.exists(results_dir):
+        os.makedirs(results_dir)
+
+    # 產生檔案名稱（以今日日期命名）
+    today = datetime.now().strftime("%Y-%m-%d")
+    file_path = f"{results_dir}/{today}.png"
+
+    # 畫圖
+    plt.figure(figsize=(12,6))
+    plt.plot(df_all['date'], df_all['Close'], label="Real/Pred Close")
+    plt.plot(df_all['date'], df_all['SMA_5'], label="SMA 5")
+    plt.plot(df_all['date'], df_all['SMA_10'], label="SMA 10")
+    plt.legend()
+    plt.title("2301.TW 預測 + 5/10 日線")
+
+    # 儲存成檔案（覆蓋式）
+    plt.savefig(file_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"📌 圖片已儲存：{file_path}")
+
+
+
+# ============================ ▶️ 主流程 ============================
+if __name__ == "__main__":
+    df = fetch_and_calculate()
+    save_to_firestore(df)
+
+    df_train = read_from_firestore()
+    model, scaler, scaled = train_lstm(df_train)
+
+    df_future = predict_future(model, scaler, scaled, df_train)
+    plot_all(df_train, df_future)
