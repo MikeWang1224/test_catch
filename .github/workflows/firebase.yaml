@@ -34,7 +34,8 @@ jobs:
             matplotlib \
             pandas \
             numpy \
-            scikit-learn   # ⭐ 加回來
+            scikit-learn \
+            tensorflow  # ⭐ 加回來
 
       - name: Run stock prediction program
         env:
