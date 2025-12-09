@@ -190,35 +190,52 @@ def compute_pred_ma_from_pred_closes(last_known_closes, pred_closes):
 # ---------------- 畫圖函式 ----------------
 def plot_results(df_hist, df_future_preds, save_path):
     plt.figure(figsize=(14,7))
-    # 歷史最近 60 日 Close 與 SMA
+
+    # ------- 方法一：建立連續時間軸（連接昨日→今日→明日） -------
+    # 提取歷史最後 60 天
     hist_plot = df_hist.copy()
     hist_plot['date'] = pd.to_datetime(hist_plot.index).tz_localize(None)
     start_date = hist_plot['date'].max() - pd.Timedelta(days=60)
     hist_plot = hist_plot[hist_plot['date'] >= start_date]
 
-    plt.plot(hist_plot['date'], hist_plot['Close'], label='Close')
-    if 'SMA_5' in hist_plot.columns:
-        plt.plot(hist_plot['date'], hist_plot['SMA_5'], label='SMA5')
-    if 'SMA_10' in hist_plot.columns:
-        plt.plot(hist_plot['date'], hist_plot['SMA_10'], label='SMA10')
+    # 把歷史 + 未來預測合併
+    combined = pd.concat([
+        hist_plot[['date','Close','SMA_5','SMA_10']],
+        df_future_preds[['date','Pred_Close','Pred_MA5','Pred_MA10']]
+    ], ignore_index=True)
 
-    # future preds
-    future_dates = df_future_preds['date']
-    plt.plot(future_dates, df_future_preds['Pred_MA5'], '--', label='Pred MA5')
-    plt.plot(future_dates, df_future_preds['Pred_MA10'], '--', label='Pred MA10')
-    plt.plot(future_dates, df_future_preds['Pred_Close'], ':', label='Pred Close')
+    # 建立連續每日 index（方法一：線絕對接起來）
+    full_range = pd.date_range(
+        start=combined['date'].min(),
+        end=combined['date'].max(),
+        freq='D'
+    )
+
+    full_df = pd.DataFrame({'date': full_range})
+    combined = full_df.merge(combined, on='date', how='left')
+
+    # 畫線（歷史部分）
+    plt.plot(combined['date'], combined['Close'], label='Close')
+    plt.plot(combined['date'], combined['SMA_5'], label='SMA5')
+    plt.plot(combined['date'], combined['SMA_10'], label='SMA10')
+
+    # 畫線（未來預測）
+    plt.plot(combined['date'], combined['Pred_Close'], ':', label='Pred Close')
+    plt.plot(combined['date'], combined['Pred_MA5'], '--', label='Pred MA5')
+    plt.plot(combined['date'], combined['Pred_MA10'], '--', label='Pred MA10')
 
     plt.gca().xaxis.set_major_locator(mdates.DayLocator(interval=1))
     plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
     plt.gcf().autofmt_xdate(rotation=45)
     plt.legend()
-    plt.title("2301.TW 歷史 + 由預測 Close 計算的 Pred MA5/MA10")
+    plt.title("2301.TW 歷史 + 預測（全部時間軸連續，線保證接起來）")
     plt.xlabel("Date")
     plt.ylabel("Price")
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
     plt.close()
     print("📌 圖片已儲存：", save_path)
+
 
 # ---------------- 主流程 ----------------
 if __name__ == "__main__":
