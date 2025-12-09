@@ -49,8 +49,8 @@ def fetch_and_calculate():
     delta = df['Close'].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
-    df['RSI'] = (100 - (100 / (1 + (gain.rolling(20).mean() / loss.rolling(20).mean()))))).round(5)
-
+    df['RSI'] = (100 - (100 / (1 + (gain.rolling(20).mean() / loss.rolling(20).mean())))).round(5)
+  
     df['Lowest_14'] = df['Low'].rolling(window=14).min()
     df['Highest_14'] = df['High'].rolling(window=14).max()
     df['K'] = (100 * (df['Close'] - df['Lowest_14']) / (df['Highest_14'] - df['Lowest_14'])).round(5)
