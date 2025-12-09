@@ -318,8 +318,13 @@ def plot_all(df_real, df_future, hist_days=30):
     df_real['date'] = pd.to_datetime(df_real.index)
     df_future['date'] = pd.to_datetime(df_future['date'])
 
-    # 取最後 hist_days 天歷史資料
-    df_plot_real = df_real.iloc[-hist_days:]
+    # 取得台灣時間昨天日期
+    tz = pytz.timezone("Asia/Taipei")
+    today = datetime.now(tz).date()
+    yesterday = today - timedelta(days=1)
+
+    # 篩選從昨天往前 hist_days 天的資料
+    df_plot_real = df_real[df_real['date'] <= yesterday].iloc[-hist_days:]
 
     plt.figure(figsize=(16,8))  # 放大圖尺寸
 
@@ -347,12 +352,10 @@ def plot_all(df_real, df_future, hist_days=30):
     results_dir = "results"
     if not os.path.exists(results_dir):
         os.makedirs(results_dir)
-    today = datetime.now().strftime("%Y-%m-%d")
     file_path = f"{results_dir}/{today}.png"
     plt.savefig(file_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"📌 圖片已儲存：{file_path}")
-
 
 
 # ============================ ▶️ 主流程 ============================
