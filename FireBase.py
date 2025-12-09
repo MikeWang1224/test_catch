@@ -16,7 +16,7 @@ from firebase_admin import credentials, firestore
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
@@ -89,21 +89,6 @@ def save_to_firestore(df):
     print("🔥 Firestore 寫入完成")
 
 
-# ============================ 📥 Firestore 讀取 ============================
-def read_from_firestore():
-    docs = db.collection("NEW_stock_data_liteon").stream()
-
-    rows = []
-    for doc in docs:
-        data = doc.to_dict().get("2301.TW", {})
-        data["date"] = doc.id
-        rows.append(data)
-
-    df = pd.DataFrame(rows).sort_values("date")
-    df.reset_index(drop=True, inplace=True)
-    return df
-
-
 # ============================ 🤖 建 LSTM 模型 ============================
 def train_lstm(df):
     features = ['Close', 'Volume', 'MACD', 'RSI', 'K', 'D']
@@ -148,15 +133,15 @@ def predict_future_ma(model, scaler_x, scaler_y, X_scaled, df):
         pred = model.predict(last_30.reshape(1, 30, X_scaled.shape[1]))
         future.append(pred[0])
 
-        # 更新 last_30
+        # 更新 last_30，用預測 Close 替代
         new_row = np.zeros((1, X_scaled.shape[1]))
-        new_row[0, 0] = pred[0][0]  # 使用 MA5 預測替代 Close
+        new_row[0, 0] = pred[0][0]  # MA5 預測替代 Close
         last_30 = np.append(last_30[1:], new_row, axis=0)
 
     future_array = np.array(future)
     future_ma = scaler_y.inverse_transform(future_array)
 
-    dates = pd.date_range(df['date'].iloc[-1], periods=10)[1:]  # 從明天開始
+    dates = pd.date_range(df['date'].iloc[-1] + timedelta(days=1), periods=10)
     df_future = pd.DataFrame({
         "date": dates,
         "Pred_MA5": future_ma[:, 0],
@@ -202,8 +187,8 @@ if __name__ == "__main__":
     df = fetch_and_calculate()
     save_to_firestore(df)
 
-    df_train = read_from_firestore()
-    model, scaler_x, scaler_y, X_scaled = train_lstm(df_train)
+    # 🔥 直接用抓回的 df 訓練 LSTM
+    model, scaler_x, scaler_y, X_scaled = train_lstm(df)
 
-    df_future = predict_future_ma(model, scaler_x, scaler_y, X_scaled, df_train)
-    plot_all(df_train, df_future)
+    df_future = predict_future_ma(model, scaler_x, scaler_y, X_scaled, df)
+    plot_all(df, df_future)
