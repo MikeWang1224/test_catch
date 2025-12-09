@@ -177,19 +177,26 @@ def compute_pred_ma_from_pred_closes(last_known_closes, pred_closes):
 # ---------------- 畫圖函式（交易日版，預測線連接歷史線） ----------------
 def plot_all(df_real, df_future, hist_days=60):
     df_real = df_real.copy()
-    df_real['date'] = pd.to_datetime(df_real.index).tz_localize(None)
-    df_plot_real = df_real.tail(hist_days)
+    df_real = df_real.tail(hist_days)
     df_future = df_future.copy()
-    df_future['date'] = pd.to_datetime(df_future['date'])
 
-    # 將最後一天歷史加入預測線開頭
-    last_hist_date = df_plot_real['date'].iloc[-1]
-    last_hist_close = df_plot_real['Close'].iloc[-1]
-    last_sma5 = df_plot_real['SMA_5'].iloc[-1] if 'SMA_5' in df_plot_real.columns else last_hist_close
-    last_sma10 = df_plot_real['SMA_10'].iloc[-1] if 'SMA_10' in df_plot_real.columns else last_hist_close
+    # 使用 index 作為連續 X 軸
+    plt.figure(figsize=(16,8))
+
+    # 歷史收盤線
+    plt.plot(range(len(df_real)), df_real['Close'], label="Close")
+    if 'SMA_5' in df_real.columns:
+        plt.plot(range(len(df_real)), df_real['SMA_5'], label="SMA5")
+    if 'SMA_10' in df_real.columns:
+        plt.plot(range(len(df_real)), df_real['SMA_10'], label="SMA10")
+
+    # 將最後一天歷史加入預測開頭
+    last_hist_close = df_real['Close'].iloc[-1]
+    last_sma5 = df_real['SMA_5'].iloc[-1] if 'SMA_5' in df_real.columns else last_hist_close
+    last_sma10 = df_real['SMA_10'].iloc[-1] if 'SMA_10' in df_real.columns else last_hist_close
+
     df_future_plot = pd.concat([
         pd.DataFrame([{
-            "date": last_hist_date,
             "Pred_Close": last_hist_close,
             "Pred_MA5": last_sma5,
             "Pred_MA10": last_sma10
@@ -197,30 +204,28 @@ def plot_all(df_real, df_future, hist_days=60):
         df_future
     ], ignore_index=True)
 
-    plt.figure(figsize=(16,8))
-    plt.plot(df_plot_real['date'], df_plot_real['Close'], label="Close")
-    if 'SMA_5' in df_plot_real.columns:
-        plt.plot(df_plot_real['date'], df_plot_real['SMA_5'], label="SMA5")
-    if 'SMA_10' in df_plot_real.columns:
-        plt.plot(df_plot_real['date'], df_plot_real['SMA_10'], label="SMA10")
+    # 預測線（連續）
+    plt.plot(range(len(df_real)-1, len(df_real)-1+len(df_future_plot)), df_future_plot['Pred_Close'], ':', label='Pred Close')
+    plt.plot(range(len(df_real)-1, len(df_real)-1+len(df_future_plot)), df_future_plot['Pred_MA5'], '--', label="Pred MA5")
+    plt.plot(range(len(df_real)-1, len(df_real)-1+len(df_future_plot)), df_future_plot['Pred_MA10'], '--', label="Pred MA10")
 
-    plt.plot(df_future_plot['date'], df_future_plot['Pred_Close'], ':', label='Pred Close')
-    plt.plot(df_future_plot['date'], df_future_plot['Pred_MA5'], '--', label="Pred MA5")
-    plt.plot(df_future_plot['date'], df_future_plot['Pred_MA10'], '--', label="Pred MA10")
+    # X 軸標記用交易日日期
+    all_dates = list(df_real.index) + list(df_future['date'])
+    tick_pos = range(0, len(all_dates), max(1, len(all_dates)//10))
+    tick_labels = [pd.Timestamp(d).strftime('%m-%d') for i,d in enumerate(all_dates) if i in tick_pos]
+    plt.xticks([i for i in tick_pos], tick_labels, rotation=45)
 
-    plt.xticks(df_future_plot['date'], [d.strftime('%m-%d') for d in df_future_plot['date']], rotation=45)
     plt.legend()
-    plt.title("2301.TW 歷史 + 預測（交易日）")
+    plt.title("2301.TW 歷史 + 預測（交易日連續）")
     plt.xlabel("Date")
     plt.ylabel("Price")
 
-    results_dir = "results"
-    os.makedirs(results_dir, exist_ok=True)
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    file_path = f"{results_dir}/{today_str}_future_trade_days.png"
+    os.makedirs("results", exist_ok=True)
+    file_path = f"results/{datetime.now().strftime('%Y-%m-%d')}_future_trade_days.png"
     plt.savefig(file_path, dpi=300, bbox_inches='tight')
     plt.close()
     print("📌 圖片已儲存：", file_path)
+
 
 # ---------------- 主流程 ----------------
 if __name__ == "__main__":
