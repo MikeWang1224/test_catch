@@ -41,10 +41,6 @@ def fetch_and_calculate():
     stock = yf.Ticker(ticker_symbol)
     df = stock.history(period="6mo")
 
-    # 將 index 轉為 date 欄位
-    df.reset_index(inplace=True)
-    df.rename(columns={'Date':'date'}, inplace=True)
-
     # 技術指標計算
     df['SMA_5'] = df['Close'].rolling(window=5).mean().round(5)
     df['SMA_10'] = df['Close'].rolling(window=10).mean().round(5)
@@ -53,7 +49,7 @@ def fetch_and_calculate():
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
     df['RSI'] = (100 - (100 / (1 + (gain.rolling(20).mean() / loss.rolling(20).mean())))).round(5)
-  
+
     df['Lowest_14'] = df['Low'].rolling(window=14).min()
     df['Highest_14'] = df['High'].rolling(window=14).max()
     df['K'] = (100 * (df['Close'] - df['Lowest_14']) / (df['Highest_14'] - df['Lowest_14'])).round(5)
@@ -64,8 +60,8 @@ def fetch_and_calculate():
     df['MACD'] = (df['EMA_12'] - df['EMA_26']).round(5)
 
     # 計算未來 MA5、MA10 作為 LSTM 預測目標
-    df['Fut_MA5'] = df['Close'].shift(-4).rolling(5).mean()
-    df['Fut_MA10'] = df['Close'].shift(-9).rolling(10).mean()
+    df['Fut_MA5'] = df['Close'].rolling(5).mean().shift(-4)
+    df['Fut_MA10'] = df['Close'].rolling(10).mean().shift(-9)
 
     return df.dropna()
 
@@ -79,7 +75,7 @@ def save_to_firestore(df):
     count = 0
 
     for idx, row in df.iterrows():
-        date_str = row['date'].strftime("%Y-%m-%d")
+        date_str = idx.strftime("%Y-%m-%d")
         data = {col: float(row[col]) for col in selected if not pd.isna(row[col])}
         doc_ref = db.collection(collection).document(date_str)
         batch.set(doc_ref, {"2301.TW": data})
@@ -91,21 +87,6 @@ def save_to_firestore(df):
 
     batch.commit()
     print("🔥 Firestore 寫入完成")
-
-
-# ============================ 📥 Firestore 讀取 ============================
-def read_from_firestore():
-    docs = db.collection("NEW_stock_data_liteon").stream()
-
-    rows = []
-    for doc in docs:
-        data = doc.to_dict().get("2301.TW", {})
-        data["date"] = pd.to_datetime(doc.id)
-        rows.append(data)
-
-    df = pd.DataFrame(rows).sort_values("date")
-    df.reset_index(drop=True, inplace=True)
-    return df
 
 
 # ============================ 🤖 建 LSTM 模型 ============================
@@ -148,20 +129,21 @@ def predict_future_ma(model, scaler_x, scaler_y, X_scaled, df):
     last_30 = X_scaled[-30:]
     future = []
 
-    for _ in range(10):  # 預測未來 10 天 MA
+    for _ in range(10):
         pred = model.predict(last_30.reshape(1, 30, X_scaled.shape[1]))
         future.append(pred[0])
 
         # 更新 last_30
         new_row = np.zeros((1, X_scaled.shape[1]))
-        new_row[0, 0] = pred[0][0]  # 使用 Pred MA5 替代 Close
+        new_row[0, 0] = pred[0][0]  # Close 位置可用 MA5 代替
         last_30 = np.append(last_30[1:], new_row, axis=0)
 
     future_array = np.array(future)
     future_ma = scaler_y.inverse_transform(future_array)
 
-    last_day = df['date'].iloc[-1]
-    dates = pd.date_range(last_day + timedelta(days=1), periods=10)
+    # 使用 fetch_and_calculate() 回傳的 df，直接從最後日期推算
+    last_date = pd.to_datetime(df.index[-1])
+    dates = [last_date + timedelta(days=i) for i in range(1, 11)]
 
     df_future = pd.DataFrame({
         "date": dates,
@@ -174,7 +156,7 @@ def predict_future_ma(model, scaler_x, scaler_y, X_scaled, df):
 
 # ============================ 📈 畫圖 ============================
 def plot_all(df_real, df_future):
-    df_real['date'] = pd.to_datetime(df_real['date'])
+    df_real['date'] = pd.to_datetime(df_real.index)
     plt.figure(figsize=(12,6))
 
     # 畫收盤價
@@ -205,11 +187,11 @@ def plot_all(df_real, df_future):
 
 # ============================ ▶️ 主流程 ============================
 if __name__ == "__main__":
-    df = fetch_and_calculate()
-    save_to_firestore(df)
+    df = fetch_and_calculate()          # 抓股價 + 計算指標
+    save_to_firestore(df)               # 寫入 Firestore
 
-    df_train = read_from_firestore()
-    model, scaler_x, scaler_y, X_scaled = train_lstm(df_train)
+    # 直接用 df 訓練 LSTM，避免 KeyError
+    model, scaler_x, scaler_y, X_scaled = train_lstm(df)
 
-    df_future = predict_future_ma(model, scaler_x, scaler_y, X_scaled, df_train)
-    plot_all(df_train, df_future)
+    df_future = predict_future_ma(model, scaler_x, scaler_y, X_scaled, df)
+    plot_all(df, df_future)
