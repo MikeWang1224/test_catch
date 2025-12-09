@@ -193,46 +193,54 @@ def plot_all(df_real, df_future, hist_days=60):
     df_real = df_real.copy()
     df_real['date'] = pd.to_datetime(df_real.index).tz_localize(None)
 
-    # 取最近 hist_days 個「交易日」
+    # 取最近 hist_days 個交易日
     df_plot_real = df_real.tail(hist_days)
 
-    # df_future 已為商業日（下方 main 產生），但仍轉成 datetime
+    # df_future 已為商業日，但轉 datetime
     df_future = df_future.copy()
     df_future['date'] = pd.to_datetime(df_future['date'])
 
     plt.figure(figsize=(16,8))
 
-    # 畫歷史線（交易日自然連接）
+    # 畫歷史線（交易日連接）
     plt.plot(df_plot_real['date'], df_plot_real['Close'], label="Close")
     if 'SMA_5' in df_plot_real.columns:
         plt.plot(df_plot_real['date'], df_plot_real['SMA_5'], label="SMA5")
     if 'SMA_10' in df_plot_real.columns:
         plt.plot(df_plot_real['date'], df_plot_real['SMA_10'], label="SMA10")
 
-    # 畫預測線（使用商業日日期）
-    plt.plot(df_future['date'], df_future['Pred_Close'], ':', label='Pred Close')
-    plt.plot(df_future['date'], df_future['Pred_MA5'], '--', label="Pred MA5")
-    plt.plot(df_future['date'], df_future['Pred_MA10'], '--', label="Pred MA10")
+    # 將最後一天歷史收盤價接到預測線的起點，確保連續
+    last_hist_date = df_plot_real['date'].iloc[-1]
+    last_hist_close = df_plot_real['Close'].iloc[-1]
 
-    # x 軸格式：每週一個刻度（避免過密）
-    plt.gca().xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=mdates.MO, interval=1))
+    df_future_plot = df_future.copy()
+    df_future_plot.loc[-1] = [last_hist_date, last_hist_close,
+                              df_plot_real['SMA_5'].iloc[-1] if 'SMA_5' in df_plot_real.columns else last_hist_close,
+                              df_plot_real['SMA_10'].iloc[-1] if 'SMA_10' in df_plot_real.columns else last_hist_close]
+    df_future_plot = df_future_plot.sort_values('date').reset_index(drop=True)
+
+    # 畫預測線（連續）
+    plt.plot(df_future_plot['date'], df_future_plot['Pred_Close'], ':', label='Pred Close')
+    plt.plot(df_future_plot['date'], df_future_plot['Pred_MA5'], '--', label="Pred MA5")
+    plt.plot(df_future_plot['date'], df_future_plot['Pred_MA10'], '--', label="Pred MA10")
+
+    # X 軸每天一個刻度
+    plt.gca().xaxis.set_major_locator(mdates.DayLocator(interval=1))
     plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
     plt.gcf().autofmt_xdate(rotation=45)
 
     plt.legend()
-    plt.title("2301.TW 歷史 + 預測（僅交易日，線條完整接續）")
+    plt.title("2301.TW 歷史 + 預測（每日）")
     plt.xlabel("Date")
     plt.ylabel("Price")
 
     results_dir = "results"
-    if not os.path.exists(results_dir):
-        os.makedirs(results_dir)
+    os.makedirs(results_dir, exist_ok=True)
     today_str = datetime.now().strftime("%Y-%m-%d")
-    file_path = f"{results_dir}/{today_str}_future.png"
+    file_path = f"{results_dir}/{today_str}_future_daily.png"
     plt.savefig(file_path, dpi=300, bbox_inches='tight')
     plt.close()
     print("📌 圖片已儲存：", file_path)
-
 
 # ---------------- 主流程 ----------------
 if __name__ == "__main__":
