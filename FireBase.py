@@ -312,20 +312,20 @@ def predict_future_ma(model, scaler_x, scaler_y, X_scaled, df):
 
 
 # ============================ 📈 畫圖（每日刻度 + 從今天開始） ============================
-import pytz
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from datetime import datetime, timedelta
+import os
+import pandas as pd
 
 def plot_all(df_real, df_future, hist_days=30):
-    # 轉成 datetime（帶時區）
-    tz = pytz.timezone("Asia/Taipei")
-    df_real['date'] = pd.to_datetime(df_real.index).tz_localize(None)  # 移除原本可能有的時區
-    df_future['date'] = pd.to_datetime(df_future['date']).tz_localize(None)
+    # 將歷史日期轉 datetime
+    df_real['date'] = pd.to_datetime(df_real.index)
+    df_future['date'] = pd.to_datetime(df_future['date'])
 
     # 取得最後交易日（歷史資料最後一筆）
     last_trade_date = df_real['date'].max()
-    # 從昨天開始畫
+    # 從最後交易日往前 hist_days 天
     start_date = last_trade_date - timedelta(days=hist_days-1)
 
     # 篩選歷史資料
@@ -358,7 +358,7 @@ def plot_all(df_real, df_future, hist_days=30):
     results_dir = "results"
     if not os.path.exists(results_dir):
         os.makedirs(results_dir)
-    today_str = datetime.now(tz).strftime("%Y-%m-%d")
+    today_str = datetime.now().strftime("%Y-%m-%d")
     file_path = f"{results_dir}/{today_str}.png"
     plt.savefig(file_path, dpi=300, bbox_inches='tight')
     plt.close()
