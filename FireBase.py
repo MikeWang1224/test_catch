@@ -254,51 +254,62 @@ def compute_pred_ma_from_pred_closes(last_known_closes, pred_closes):
         results.append((pc, ma5, ma10))
     return results
 
-# ---------------- 繪圖 + 上傳 Storage（取代原 plot_all） ----------------
+# ---------------- 繪圖 + 上傳 Storage（修正版） ----------------
 def plot_and_upload_to_storage(df_real, df_future, bucket_obj=None, hist_days=60):
     """
     畫圖並上傳至 Firebase Storage（如果 bucket_obj 提供）。
     回傳 public image url 或 None。
+    修正：
+      - 確保預測序列的日期與 labels 對齊（包含起始已知日期）
+      - pred_table 與 labels 都使用同一份 df_future_plot（包含起始點）
     """
     df_real_plot = df_real.copy().tail(10)  # 顯示最近 10 日
 
+    if df_real_plot.empty:
+        print("⚠️ df_real_plot 為空，無法繪圖")
+        return None
+
+    df_future = df_future.copy().reset_index(drop=True)
+
+    # 建立一個包含最後一個歷史日期 + future dates 的 df，用於繪圖 labels
+    last_hist_date = df_real_plot.index[-1]
+    start_row = {
+        "date": last_hist_date,
+        "Pred_Close": df_real_plot['Close'].iloc[-1],
+        "Pred_MA5": df_real_plot['SMA_5'].iloc[-1] if 'SMA_5' in df_real_plot.columns else df_real_plot['Close'].iloc[-1],
+        "Pred_MA10": df_real_plot['SMA_10'].iloc[-1] if 'SMA_10' in df_real_plot.columns else df_real_plot['Close'].iloc[-1]
+    }
+    df_future_plot = pd.concat([pd.DataFrame([start_row]), df_future], ignore_index=True)
+
     plt.figure(figsize=(16,8))
 
-    # 歷史
-    x_real = range(len(df_real_plot))
-    plt.plot(x_real, df_real_plot['Close'], label="Close")
+    # 歷史：畫近 10 日的 Close / SMA5 / SMA10
+    x_real = list(range(len(df_real_plot)))
+    plt.plot(x_real, df_real_plot['Close'].values, label="Close")
     if 'SMA_5' in df_real_plot.columns:
-        plt.plot(x_real, df_real_plot['SMA_5'], label="SMA5")
+        plt.plot(x_real, df_real_plot['SMA_5'].values, label="SMA5")
     if 'SMA_10' in df_real_plot.columns:
-        plt.plot(x_real, df_real_plot['SMA_10'], label="SMA10")
+        plt.plot(x_real, df_real_plot['SMA_10'].values, label="SMA10")
 
-    # 建立和連接預測序列
-    last_hist_close = df_real_plot['Close'].iloc[-1]
-    last_sma5 = df_real_plot['SMA_5'].iloc[-1] if 'SMA_5' in df_real_plot.columns else last_hist_close
-    last_sma10 = df_real_plot['SMA_10'].iloc[-1] if 'SMA_10' in df_real_plot.columns else last_hist_close
+    # 預測（從最後一個歷史索引開始）
+    offset = len(df_real_plot) - 1
+    x_future = [offset + i for i in range(len(df_future_plot))]
+    plt.plot(x_future, df_future_plot['Pred_Close'].values, linestyle=':', marker='o', label="Pred Close")
+    plt.plot(x_future, df_future_plot['Pred_MA5'].values, linestyle='--', label="Pred MA5")
+    plt.plot(x_future, df_future_plot['Pred_MA10'].values, linestyle='--', label="Pred MA10")
 
-    df_future_plot = pd.concat([
-        pd.DataFrame([{
-            "Pred_Close": last_hist_close,
-            "Pred_MA5": last_sma5,
-            "Pred_MA10": last_sma10
-        }]),
-        df_future.reset_index(drop=True)
-    ], ignore_index=True)
+    # X 軸標籤
+    # Build labels: history except last (since last is start_row), then all df_future_plot dates
+    labels = []
+    for d in df_real_plot.index[:-1]:
+        labels.append(pd.Timestamp(d).strftime('%m-%d'))
+    for d in df_future_plot['date']:
+        labels.append(pd.Timestamp(d).strftime('%m-%d'))
 
-    x_future = range(len(df_real_plot)-1, len(df_real_plot)-1 + len(df_future_plot))
-    plt.plot(x_future, df_future_plot['Pred_Close'], ':', label="Pred Close")
-    plt.plot(x_future, df_future_plot['Pred_MA5'], '--', label="Pred MA5")
-    plt.plot(x_future, df_future_plot['Pred_MA10'], '--', label="Pred MA10")
-
-    # X 軸標籤（日期）
-    all_dates = list(df_real_plot.index) + list(df_future['date'])
-    plt.xticks(
-        ticks=range(len(all_dates)),
-        labels=[pd.Timestamp(d).strftime('%m-%d') for d in all_dates],
-        rotation=45
-    )
-    plt.xlim(0, len(all_dates) - 1)
+    ticks = list(range(len(labels)))
+    # Ensure ticks cover plotted range
+    plt.xticks(ticks=ticks, labels=labels, rotation=45)
+    plt.xlim(0, max(ticks))
 
     plt.legend()
     plt.title("2301.TW 歷史 + 預測（近 10 日 + 未來 10 日）")
@@ -312,18 +323,21 @@ def plot_and_upload_to_storage(df_real, df_future, bucket_obj=None, hist_days=60
     plt.close()
     print("📌 圖片已儲存：", file_path)
 
-    # 若提供 bucket，則上傳並公開
+    # 若提供 bucket，則上傳並回傳 URL（try/catch）
     if bucket_obj is not None:
         try:
             blob = bucket_obj.blob(f"LSTM_Pred_Images/{file_name}")
             blob.upload_from_filename(file_path)
-            # make public (depends on your Storage rules; if not desired, remove)
+            public_url = None
             try:
                 blob.make_public()
+                public_url = blob.public_url
             except Exception:
-                # 某些專案不允許 make_public；可以保留私有然後使用 signed url 或 firebase rules 控制
-                pass
-            public_url = blob.public_url
+                # 無法 make public（多為 storage policy）；仍回傳 blob.public_url 若可取得
+                try:
+                    public_url = blob.public_url
+                except Exception:
+                    public_url = None
             print("🔥 圖片已上傳至 Storage：", public_url)
             return public_url
         except Exception as e:
@@ -341,6 +355,7 @@ def compute_metrics(y_true, y_pred):
         rmses.append(math.sqrt(mean_squared_error(y_true[:, step], y_pred[:, step])))
     return np.array(maes), np.array(rmses)
 
+
 def compute_ma_from_predictions(last_known_window_closes, y_pred_matrix, ma_period=5):
     n_samples, window = last_known_window_closes.shape
     steps = y_pred_matrix.shape[1]
@@ -352,6 +367,7 @@ def compute_ma_from_predictions(last_known_window_closes, y_pred_matrix, ma_peri
             look = seq[-ma_period:] if len(seq) >= ma_period else seq
             preds_ma[i, t] = np.mean(look)
     return preds_ma
+
 
 def compute_true_ma(last_window, y_true, ma_period=5):
     n_samples, window = last_window.shape
@@ -460,15 +476,15 @@ if __name__ == "__main__":
     last_known_closes_all = X_test[:, -1, 0]  # 每個測試 sample 最後一個已知 close
     baselineA = np.vstack([last_known_closes_all for _ in range(pred.shape[1])]).T  # (n_samples, steps)
 
-    # Baseline B: last known SMA5 repeated (若 features 有 SMA_5，否則 fallback to baselineA)
-    if 'SMA_5' in features:
-        try:
-            sma5_idx = features.index('SMA_5')
-            last_known_sma5_all = X_test[:, -1, sma5_idx]
+    # Baseline B: 使用 df 的最後一個 SMA_5 值作為保守 baseline（若有）
+    try:
+        if 'SMA_5' in df.columns and not df['SMA_5'].dropna().empty:
+            last_sma5_val = df['SMA_5'].dropna().iloc[-1]
+            last_known_sma5_all = np.array([last_sma5_val] * X_test.shape[0])
             baselineB = np.vstack([last_known_sma5_all for _ in range(pred.shape[1])]).T
-        except Exception:
+        else:
             baselineB = baselineA.copy()
-    else:
+    except Exception:
         baselineB = baselineA.copy()
 
     # Baseline C: simple random-walk on returns
@@ -547,10 +563,20 @@ if __name__ == "__main__":
                 print("寫入預測到 Firestore 發生錯誤：", e)
         # 同時寫入 metadata doc（包含 image_url）
         try:
+            pred_table_serialized = []
+            for _, r in df_future.reset_index(drop=True).iterrows():
+                rec = {
+                    "date": pd.Timestamp(r['date']).strftime("%Y-%m-%d"),
+                    "Pred_Close": float(r['Pred_Close']),
+                    "Pred_MA5": float(r['Pred_MA5']),
+                    "Pred_MA10": float(r['Pred_MA10'])
+                }
+                pred_table_serialized.append(rec)
+
             meta_doc = {
                 "date": datetime.now().strftime("%Y-%m-%d"),
                 "image_url": image_url,
-                "pred_table": [row for _, row in df_future.iterrows()],
+                "pred_table": pred_table_serialized,
                 "update_time": datetime.now().isoformat()
             }
             db.collection("NEW_stock_data_liteon_preds_meta").document(datetime.now().strftime("%Y-%m-%d")).set(meta_doc)
@@ -558,4 +584,3 @@ if __name__ == "__main__":
             print("寫入預測 metadata 到 Firestore 發生錯誤：", e)
 
         print("🔥 預測寫入 Firestore 完成")
-
