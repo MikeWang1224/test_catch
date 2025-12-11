@@ -6,6 +6,8 @@
  - 將歷史股票資料（Close, Volume, MACD, RSI, K, D）寫回 Firestore (collection: NEW_stock_data_liteon)
 流程：
  - 抓資料 -> 計算指標 -> 寫回 Firestore -> LSTM 訓練/預測 -> 畫圖 -> 寫入預測到 Firestore
+新增：
+ - baseline 評估（last-close, last-SMA5 fallback, simple random-walk returns）
 """
 import os, json
 import firebase_admin
@@ -22,6 +24,7 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 import math
+import random
 
 # ---------------- Firebase 初始化 ----------------
 key_dict = json.loads(os.environ.get("FIREBASE", "{}"))
@@ -292,6 +295,39 @@ def plot_all(df_real, df_future, hist_days=60):
     plt.close()
     print("📌 圖片已儲存：", file_path)
 
+# ---------------- Baseline / MA helper functions ----------------
+def compute_metrics(y_true, y_pred):
+    maes = []
+    rmses = []
+    for step in range(y_true.shape[1]):
+        maes.append(mean_absolute_error(y_true[:, step], y_pred[:, step]))
+        rmses.append(math.sqrt(mean_squared_error(y_true[:, step], y_pred[:, step])))
+    return np.array(maes), np.array(rmses)
+
+def compute_ma_from_predictions(last_known_window_closes, y_pred_matrix, ma_period=5):
+    n_samples, window = last_known_window_closes.shape
+    steps = y_pred_matrix.shape[1]
+    preds_ma = np.zeros((n_samples, steps))
+    for i in range(n_samples):
+        seq = list(last_known_window_closes[i])  # copy
+        for t in range(steps):
+            seq.append(y_pred_matrix[i, t])
+            look = seq[-ma_period:] if len(seq) >= ma_period else seq
+            preds_ma[i, t] = np.mean(look)
+    return preds_ma
+
+def compute_true_ma(last_window, y_true, ma_period=5):
+    n_samples, window = last_window.shape
+    steps = y_true.shape[1]
+    true_ma = np.zeros((n_samples, steps))
+    for i in range(n_samples):
+        seq = list(last_window[i])
+        for t in range(steps):
+            seq.append(y_true[i, t])
+            look = seq[-ma_period:] if len(seq) >= ma_period else seq
+            true_ma[i, t] = np.mean(look)
+    return true_ma
+
 # ---------------- 主流程 ----------------
 if __name__ == "__main__":
     TICKER = "2301.TW"
@@ -348,15 +384,15 @@ if __name__ == "__main__":
     pred_s = model.predict(X_test_s)
     pred = scaler_y.inverse_transform(pred_s)
 
-    # 評估
+    # ========== 你的原始評估（每步 MAE / RMSE） ==========
     maes, rmses = [], []
     for step in range(PRED_STEPS):
         y_true, y_pred = y_test[:, step], pred[:, step]
         maes.append(mean_absolute_error(y_true, y_pred))
         rmses.append(math.sqrt(mean_squared_error(y_true, y_pred)))
-    print("MAE per step:", np.round(maes,4))
-    print("RMSE per step:", np.round(rmses,4))
-    print("Avg MAE:", np.round(np.mean(maes),4))
+    print("MAE per step (model):", np.round(maes,4))
+    print("RMSE per step (model):", np.round(rmses,4))
+    print("Avg MAE (model):", np.round(np.mean(maes),4))
 
     # 取最後一個測試 sample 的已知 closes（作為起始序列），並用最後一筆預測計算 Pred MA5/MA10
     last_known_window = X_test[-1]
@@ -378,6 +414,95 @@ if __name__ == "__main__":
     plot_all(df, df_future)
 
     print(df_future)
+
+    # ---------------- Baseline 評估（整合區塊） ----------------
+    print("\n===== Baseline 評估開始 =====")
+
+    # Baseline A: last known close repeated
+    last_known_closes_all = X_test[:, -1, 0]  # 每個測試 sample 最後一個已知 close
+    baselineA = np.vstack([last_known_closes_all for _ in range(pred.shape[1])]).T  # (n_samples, steps)
+
+    # Baseline B: last known SMA5 repeated (若 features 有 SMA_5，否則 fallback to baselineA)
+    if 'SMA_5' in features:
+        try:
+            sma5_idx = features.index('SMA_5')
+            last_known_sma5_all = X_test[:, -1, sma5_idx]
+            baselineB = np.vstack([last_known_sma5_all for _ in range(pred.shape[1])]).T
+        except Exception:
+            baselineB = baselineA.copy()
+    else:
+        # 嘗試從原始 df 抓取對應最後的 SMA5（若可能），否則退回 baselineA
+        try:
+            # 對每個 X_test sample 我們無法直接從 df 對齊 index（安全退回）
+            baselineB = baselineA.copy()
+        except Exception:
+            baselineB = baselineA.copy()
+
+    # Baseline C: simple random-walk on returns (使用每個 sample 最後已知日的 1-step return 作為未來 returns 的 sample)
+    # 這是一個非常簡單的 stochastic baseline：我們用最後一天的 RET_1 作為未來每一步的 returns，然後累積回價格
+    last_ret_1 = X_test[:, -1, features.index('RET_1')] if 'RET_1' in features else None
+    if last_ret_1 is not None:
+        baselineC = np.zeros_like(baselineA)
+        for i in range(baselineC.shape[0]):
+            price = last_known_closes_all[i]
+            r = last_ret_1[i]
+            for t in range(baselineC.shape[1]):
+                price = price * (1 + r)
+                baselineC[i, t] = price
+    else:
+        baselineC = baselineA.copy()
+
+    # 計算 metrics（每 step）
+    maes_model, rmses_model = compute_metrics(y_test, pred)
+    maes_bA, rmses_bA = compute_metrics(y_test, baselineA)
+    maes_bB, rmses_bB = compute_metrics(y_test, baselineB)
+    maes_bC, rmses_bC = compute_metrics(y_test, baselineC)
+
+    print("=== Per-step MAE (model) ===\n", np.round(maes_model,4))
+    print("=== Per-step RMSE (model) ===\n", np.round(rmses_model,4))
+    print("=== Per-step MAE (Baseline A: last close) ===\n", np.round(maes_bA,4))
+    print("=== Per-step MAE (Baseline B: last SMA5/fallback) ===\n", np.round(maes_bB,4))
+    print("=== Per-step MAE (Baseline C: simple returns) ===\n", np.round(maes_bC,4))
+
+    print("\nAvg MAE model:", np.round(maes_model.mean(),4), 
+          "baselineA:", np.round(maes_bA.mean(),4), "baselineB:", np.round(maes_bB.mean(),4),
+          "baselineC:", np.round(maes_bC.mean(),4))
+    print("Avg RMSE model:", np.round(rmses_model.mean(),4), 
+          "baselineA:", np.round(rmses_bA.mean(),4))
+
+    # ---------- Evaluate effect on MA5 / MA10 ----------
+    last_closes_window = X_test[:, :, 0]  # shape (n_samples, LOOKBACK)
+
+    # model MA predictions
+    model_MA5 = compute_ma_from_predictions(last_closes_window, pred, ma_period=5)
+    model_MA10 = compute_ma_from_predictions(last_closes_window, pred, ma_period=10)
+
+    # baselineA MA predictions
+    bA_MA5 = compute_ma_from_predictions(last_closes_window, baselineA, ma_period=5)
+    bA_MA10 = compute_ma_from_predictions(last_closes_window, baselineA, ma_period=10)
+
+    # baselineB MA predictions
+    bB_MA5 = compute_ma_from_predictions(last_closes_window, baselineB, ma_period=5)
+    bB_MA10 = compute_ma_from_predictions(last_closes_window, baselineB, ma_period=10)
+
+    # true MA from ground-truth y_test
+    true_MA5 = compute_true_ma(last_closes_window, y_test, ma_period=5)
+    true_MA10 = compute_true_ma(last_closes_window, y_test, ma_period=10)
+
+    mae_model_MA5 = np.mean(np.abs(model_MA5 - true_MA5))
+    mae_bA_MA5 = np.mean(np.abs(bA_MA5 - true_MA5))
+    mae_bB_MA5 = np.mean(np.abs(bB_MA5 - true_MA5))
+
+    mae_model_MA10 = np.mean(np.abs(model_MA10 - true_MA10))
+    mae_bA_MA10 = np.mean(np.abs(bA_MA10 - true_MA10))
+    mae_bB_MA10 = np.mean(np.abs(bB_MA10 - true_MA10))
+
+    print("\nMAE on derived MA5 -> model:", np.round(mae_model_MA5,4), 
+          "baselineA:", np.round(mae_bA_MA5,4), "baselineB:", np.round(mae_bB_MA5,4))
+    print("MAE on derived MA10 -> model:", np.round(mae_model_MA10,4), 
+          "baselineA:", np.round(mae_bA_MA10,4), "baselineB:", np.round(mae_bB_MA10,4))
+
+    print("===== Baseline 評估結束 =====\n")
 
     # 寫入預測到 Firestore（如啟用）
     if db is not None:
