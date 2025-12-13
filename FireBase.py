@@ -1,20 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Refactored main script (抓股票資料 / 技術指標 / Firestore 寫入 已移除)
-假設以下工作已在外部完成並提供 df：
- - 抓取 2301.TW 歷史資料
- - 計算所有技術指標
- - 將歷史資料寫回 Firestore
-
-本檔案只負責：
- - 建立 LSTM 訓練資料
- - 訓練 / 預測 multi-step Close
- - 計算 Pred MA5 / MA10
- - Baseline 評估
- - 繪圖 +（可選）上傳 Storage
- - 將預測結果寫回 Firestore
+Refactored FireBase.py
+完全從 Firestore 讀取 df，已移除抓 Yahoo / 歷史寫回
 """
-
 import os
 import math
 import numpy as np
@@ -30,15 +18,13 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 
-# Firebase（僅用於預測寫回與圖片上傳；不再負責歷史資料）
+# Firebase
 import json
 import firebase_admin
 from firebase_admin import credentials, firestore
 from google.cloud import storage
 
-# =============================================================
-# Firebase init（保留，用於 preds / image）
-# =============================================================
+# ================= Firebase 初始化 =================
 key_dict = json.loads(os.environ.get("FIREBASE", "{}"))
 db = None
 bucket = None
@@ -58,10 +44,34 @@ if key_dict:
     except Exception:
         bucket = None
 
-# =============================================================
-# Dataset helpers（保留）
-# =============================================================
+# ================= 從 Firestore 讀取 df =================
+def load_df_from_firestore(ticker="2301.TW", collection="NEW_stock_data_liteon", days=400):
+    if db is None:
+        raise RuntimeError("Firestore 未初始化")
 
+    docs = (
+        db.collection(collection)
+        .order_by("__name__", direction=firestore.Query.DESCENDING)
+        .limit(days)
+        .stream()
+    )
+
+    rows = []
+    for doc in docs:
+        payload = doc.to_dict().get(ticker)
+        if not payload:
+            continue
+        rows.append({"date": doc.id, **payload})
+
+    if not rows:
+        raise RuntimeError("Firestore 無任何股價資料")
+
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").set_index("date")
+    return df
+
+# ================= Dataset helpers =================
 def create_sequences(df, features, target_steps=10, window=60):
     X, y = [], []
     closes = df['Close'].values
@@ -78,10 +88,7 @@ def time_series_split(X, y, test_ratio=0.15):
     split_idx = n - test_n
     return X[:split_idx], X[split_idx:], y[:split_idx], y[split_idx:]
 
-# =============================================================
-# Model
-# =============================================================
-
+# ================= Model =================
 def build_lstm_multi_step(input_shape, output_steps=10):
     model = Sequential()
     model.add(LSTM(128, return_sequences=True, input_shape=input_shape))
@@ -92,10 +99,7 @@ def build_lstm_multi_step(input_shape, output_steps=10):
     model.compile(optimizer='adam', loss='mae')
     return model
 
-# =============================================================
-# MA / metrics helpers
-# =============================================================
-
+# ================= MA / metrics helpers =================
 def compute_pred_ma_from_pred_closes(last_known_closes, pred_closes):
     closes_seq = list(last_known_closes)
     results = []
@@ -106,14 +110,12 @@ def compute_pred_ma_from_pred_closes(last_known_closes, pred_closes):
         results.append((pc, ma5, ma10))
     return results
 
-
 def compute_metrics(y_true, y_pred):
     maes, rmses = [], []
     for step in range(y_true.shape[1]):
         maes.append(mean_absolute_error(y_true[:, step], y_pred[:, step]))
         rmses.append(math.sqrt(mean_squared_error(y_true[:, step], y_pred[:, step])))
     return np.array(maes), np.array(rmses)
-
 
 def compute_ma_from_predictions(last_known_window_closes, y_pred_matrix, ma_period=5):
     n_samples, _ = last_known_window_closes.shape
@@ -127,7 +129,6 @@ def compute_ma_from_predictions(last_known_window_closes, y_pred_matrix, ma_peri
             preds_ma[i, t] = np.mean(look)
     return preds_ma
 
-
 def compute_true_ma(last_window, y_true, ma_period=5):
     n_samples, _ = last_window.shape
     steps = y_true.shape[1]
@@ -140,10 +141,7 @@ def compute_true_ma(last_window, y_true, ma_period=5):
             true_ma[i, t] = np.mean(look)
     return true_ma
 
-# =============================================================
-# Plot + upload（保留）
-# =============================================================
-
+# ================= Plot + upload =================
 def plot_and_upload_to_storage(df_real, df_future, bucket_obj=None):
     df_real_plot = df_real.tail(10)
     if df_real_plot.empty:
@@ -153,8 +151,8 @@ def plot_and_upload_to_storage(df_real, df_future, bucket_obj=None):
     start_row = {
         'date': last_hist_date,
         'Pred_Close': df_real_plot['Close'].iloc[-1],
-        'Pred_MA5': df_real_plot['SMA_5'].iloc[-1],
-        'Pred_MA10': df_real_plot['SMA_10'].iloc[-1],
+        'Pred_MA5': df_real_plot.get('SMA_5', df_real_plot['Close']).iloc[-1],
+        'Pred_MA10': df_real_plot.get('SMA_10', df_real_plot['Close']).iloc[-1],
     }
 
     df_future_plot = pd.concat([pd.DataFrame([start_row]), df_future], ignore_index=True)
@@ -163,8 +161,10 @@ def plot_and_upload_to_storage(df_real, df_future, bucket_obj=None):
 
     x_real = range(len(df_real_plot))
     plt.plot(x_real, df_real_plot['Close'], label='Close')
-    plt.plot(x_real, df_real_plot['SMA_5'], label='SMA5')
-    plt.plot(x_real, df_real_plot['SMA_10'], label='SMA10')
+    if 'SMA_5' in df_real_plot.columns:
+        plt.plot(x_real, df_real_plot['SMA_5'], label='SMA5')
+    if 'SMA_10' in df_real_plot.columns:
+        plt.plot(x_real, df_real_plot['SMA_10'], label='SMA10')
 
     offset = len(df_real_plot) - 1
     x_future = [offset + i for i in range(len(df_future_plot))]
@@ -201,16 +201,102 @@ def plot_and_upload_to_storage(df_real, df_future, bucket_obj=None):
 
     return None
 
-# =============================================================
-# Main（df 由外部提供）
-# =============================================================
+# ================= Main =================
 if __name__ == '__main__':
     TICKER = '2301.TW'
     LOOKBACK = 60
     PRED_STEPS = 10
     TEST_RATIO = 0.15
 
-    # === df 必須已包含所有特徵與技術指標 ===
-    # 例如：from data_prepare import load_prepared_df
-    # df = load_prepared_df()
-    raise RuntimeError('請在此匯入你已完成「抓資料 + 指標 + Firestore」的 df')
+    # ---------------- 從 Firestore 讀 df ----------------
+    df = load_df_from_firestore(ticker=TICKER)
+    print("🔥 從 Firestore 讀取資料筆數:", len(df))
+
+    # ---------------- 準備特徵（LSTM） ----------------
+    features = ['Close', 'Volume', 'RET_1', 'LOG_RET_1', 'Close_minus_SMA5',
+                'SMA5_minus_SMA10', 'ATR_14', 'BB_width', 'OBV', 'OBV_SMA_20',
+                'Vol_SMA_5']
+
+    # 確認 df 包含這些欄位
+    missing = [f for f in features if f not in df.columns]
+    if missing:
+        raise RuntimeError(f"缺少必要欄位: {missing}")
+
+    df_features = df[features].dropna()
+
+    X, y = create_sequences(df_features, features, target_steps=PRED_STEPS, window=LOOKBACK)
+    X_train, X_test, y_train, y_test = time_series_split(X, y, test_ratio=TEST_RATIO)
+
+    # Scaler
+    nsamples, tw, nfeatures = X_train.shape
+    scaler_x = MinMaxScaler()
+    scaler_x.fit(X_train.reshape((nsamples*tw, nfeatures)))
+    X_train_s = scaler_x.transform(X_train.reshape((-1, nfeatures))).reshape(X_train.shape)
+    X_test_s = scaler_x.transform(X_test.reshape((-1, nfeatures))).reshape(X_test.shape)
+
+    scaler_y = MinMaxScaler()
+    scaler_y.fit(y_train)
+    y_train_s = scaler_y.transform(y_train)
+    y_test_s = scaler_y.transform(y_test)
+
+    # ---------------- LSTM 訓練 ----------------
+    model = build_lstm_multi_step(input_shape=(LOOKBACK, nfeatures), output_steps=PRED_STEPS)
+    ckpt_path = f"models/{TICKER}_best.h5"
+    os.makedirs('models', exist_ok=True)
+    es = EarlyStopping(monitor='val_loss', patience=8, restore_best_weights=True, verbose=1)
+    mc = ModelCheckpoint(ckpt_path, monitor='val_loss', save_best_only=True, verbose=1)
+
+    model.fit(X_train_s, y_train_s, validation_data=(X_test_s, y_test_s),
+              epochs=80, batch_size=32, callbacks=[es, mc], verbose=2)
+
+    # ---------------- 預測 ----------------
+    pred_s = model.predict(X_test_s)
+    pred = scaler_y.inverse_transform(pred_s)
+
+    last_known_window = X_test[-1]
+    last_known_closes = list(last_known_window[:,0])
+    results = compute_pred_ma_from_pred_closes(last_known_closes, pred[-1])
+
+    # 建立未來交易日日期
+    today = pd.Timestamp(datetime.now().date())
+    first_bday = (today + BDay(1)).date()
+    business_days = pd.bdate_range(start=first_bday, periods=PRED_STEPS)
+    df_future = pd.DataFrame({
+        "date": business_days,
+        "Pred_Close": [r[0] for r in results],
+        "Pred_MA5": [r[1] for r in results],
+        "Pred_MA10": [r[2] for r in results]
+    })
+
+    # ---------------- 繪圖 + 上傳 Storage ----------------
+    image_url = plot_and_upload_to_storage(df, df_future, bucket_obj=bucket)
+    print("Image URL:", image_url)
+
+    # ---------------- Baseline 評估 ----------------
+    last_known_closes_all = X_test[:, -1, 0]
+    baselineA = np.vstack([last_known_closes_all for _ in range(pred.shape[1])]).T
+
+    maes_model, rmses_model = compute_metrics(y_test, pred)
+    maes_bA, rmses_bA = compute_metrics(y_test, baselineA)
+
+    print("Avg MAE model:", np.round(maes_model.mean(),4), "baselineA:", np.round(maes_bA.mean(),4))
+
+    # ---------------- 寫入預測結果到 Firestore ----------------
+    if db is not None:
+        for i, row in df_future.iterrows():
+            db.collection("NEW_stock_data_liteon_preds").document(row['date'].strftime("%Y-%m-%d")).set({
+                TICKER: {
+                    "Pred_Close": float(row['Pred_Close']),
+                    "Pred_MA5": float(row['Pred_MA5']),
+                    "Pred_MA10": float(row['Pred_MA10'])
+                }
+            })
+        # metadata
+        meta_doc = {
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "image_url": image_url,
+            "pred_table": df_future.to_dict('records'),
+            "update_time": datetime.now().isoformat()
+        }
+        db.collection("NEW_stock_data_liteon_preds_meta").document(datetime.now().strftime("%Y-%m-%d")).set(meta_doc)
+        print("🔥 預測寫入 Firestore 完成")
