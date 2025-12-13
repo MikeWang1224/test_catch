@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 FireBase_LSTM_v2.py
+- Firestore 讀 OHLCV + 已算好技術指標
+- 不重算指標（避免分佈錯亂）
+- 預測 log return（多步）
+- 價格由 return 還原
+- 原預測圖不動
+- 新增：預測回測誤差圖（Pred vs Actual）
 """
 
 import os, json
@@ -15,6 +21,7 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
 
+# Firebase
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -40,27 +47,32 @@ def load_df_from_firestore(ticker, collection="NEW_stock_data_liteon", days=400)
                 rows.append({"date": doc.id, **p})
 
     df = pd.DataFrame(rows)
-    df["date"] = pd.to_datetime(df["date"])
-    return df.sort_values("date").tail(days).set_index("date")
+    if df.empty:
+        raise ValueError("⚠️ Firestore 無資料")
 
-# ================= 假日補今天（只給預測用） =================
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").tail(days).set_index("date")
+    return df
+
+# ================= 假日補今天 =================
 def ensure_today_row(df):
     today = pd.Timestamp(datetime.now().date())
-    last_trade = df.index.max()
-    if last_trade < today:
-        df.loc[today] = df.loc[last_trade]
-        print(f"⚠️ 今日無資料，使用 {last_trade.date()} 補今日")
+    last_date = df.index.max()
+    if last_date < today:
+        df.loc[today] = df.loc[last_date]
+        print(f"⚠️ 今日無資料，使用 {last_date.date()} 補今日")
     return df.sort_index()
 
-# ================= Sequence =================
+# ================= Sequence（預測 log return） =================
 def create_sequences(df, features, steps=10, window=60):
     X, y = [], []
+
     data = df[features].values
     logret = np.log(df["Close"] / df["Close"].shift())
 
     for i in range(window, len(df) - steps):
-        X.append(data[i-window:i])
-        y.append(logret.iloc[i:i+steps].values)
+        X.append(data[i - window:i])
+        y.append(logret.iloc[i:i + steps].values)
 
     return np.array(X), np.array(y)
 
@@ -74,7 +86,7 @@ def build_lstm(input_shape, steps):
     m.compile(optimizer="adam", loss="huber")
     return m
 
-# ================= 原預測圖（不動） =================
+# ================= 原預測圖（完全不動） =================
 def plot_and_save(df_hist, future_df):
     hist = df_hist.tail(10)
 
@@ -98,6 +110,22 @@ def plot_and_save(df_hist, future_df):
         "r:o", label="Pred Close"
     )
 
+    for i, price in enumerate(future_df["Pred_Close"]):
+        ax.text(x_future[i], price + 0.3, f"{price:.2f}",
+                color="red", fontsize=9, ha="center")
+
+    ax.plot(
+        np.concatenate([[x_hist[-1]], x_future]),
+        [hist["SMA5"].iloc[-1]] + future_df["Pred_MA5"].tolist(),
+        "g--o", label="Pred MA5"
+    )
+
+    ax.plot(
+        np.concatenate([[x_hist[-1]], x_future]),
+        [hist["SMA10"].iloc[-1]] + future_df["Pred_MA10"].tolist(),
+        "b--o", label="Pred MA10"
+    )
+
     ax.set_xticks(np.arange(len(all_dates)))
     ax.set_xticklabels(all_dates, rotation=45, ha="right")
 
@@ -105,23 +133,27 @@ def plot_and_save(df_hist, future_df):
     ax.set_title("2301.TW LSTM 預測（Return-based 穩定版）")
 
     os.makedirs("results", exist_ok=True)
-    plt.savefig(f"results/{datetime.now():%Y-%m-%d}_pred.png", dpi=300)
+    plt.savefig(f"results/{datetime.now():%Y-%m-%d}_pred.png",
+                dpi=300, bbox_inches="tight")
     plt.close()
 
-# ================= 回測誤差圖（✔ 完全對齊交易日） =================
-def plot_backtest_error(df_real, X_te_s, y_te, model, steps, split, lookback):
+# ================= 回測誤差圖（時間軸已對齊） =================
+def plot_backtest_error(df, X_te_s, y_te, model, steps, split, lookback):
+    """
+    使用「測試集最後一個 window」做回測
+    """
+
     anchor_idx = split + lookback - 1
 
     X_last = X_te_s[-1:]
     y_true = y_te[-1]
     pred_ret = model.predict(X_last, verbose=0)[0]
 
-    # 🔥 使用「純交易日 df」
-    dates = df_real.index[anchor_idx + 1 : anchor_idx + 1 + steps]
-    start_price = df_real["Close"].iloc[anchor_idx]
+    dates = df.index[anchor_idx + 1 : anchor_idx + 1 + steps]
+    start_price = df["Close"].iloc[anchor_idx]
 
-    p_t, p_p = start_price, start_price
     true_prices, pred_prices = [], []
+    p_t, p_p = start_price, start_price
 
     for rt, rp in zip(y_true, pred_ret):
         p_t *= np.exp(rt)
@@ -138,13 +170,24 @@ def plot_backtest_error(df_real, X_te_s, y_te, model, steps, split, lookback):
     plt.figure(figsize=(12,6))
     plt.plot(dates, true_prices, label="Actual Close")
     plt.plot(dates, pred_prices, "--o", label="Pred Close")
-    plt.xticks(dates, [d.strftime("%Y-%m-%d") for d in dates], rotation=45)
+
+    plt.xticks(
+        ticks=dates,
+        labels=[d.strftime("%Y-%m-%d") for d in dates],
+        rotation=45,
+        ha="right"
+    )
+
     plt.title(f"Backtest Prediction | MAE={mae:.2f}, RMSE={rmse:.2f}")
     plt.legend()
     plt.grid(True)
 
     os.makedirs("results", exist_ok=True)
-    plt.savefig(f"results/{datetime.now():%Y-%m-%d}_backtest.png", dpi=300)
+    plt.savefig(
+        f"results/{datetime.now():%Y-%m-%d}_backtest.png",
+        dpi=300,
+        bbox_inches="tight"
+    )
     plt.close()
 
 # ================= Main =================
@@ -153,36 +196,34 @@ if __name__ == "__main__":
     LOOKBACK = 60
     STEPS = 10
 
-    # 🔥 關鍵：分兩份 df
-    df_real = load_df_from_firestore(TICKER)
-    df_pred = ensure_today_row(df_real.copy())
+    df = load_df_from_firestore(TICKER)
+    df = ensure_today_row(df)
 
-    FEATURES = ["Close","Volume","RSI","MACD","K","D","ATR_14"]
+    FEATURES = [
+        "Close", "Volume", "RSI", "MACD", "K", "D", "ATR_14"
+    ]
 
-    for df in (df_real, df_pred):
-        df["SMA5"] = df["Close"].rolling(5).mean()
-        df["SMA10"] = df["Close"].rolling(10).mean()
+    df["SMA5"] = df["Close"].rolling(5).mean()
+    df["SMA10"] = df["Close"].rolling(10).mean()
+    df = df.dropna()
 
-    df_real = df_real.dropna()
-    df_pred = df_pred.dropna()
-
-    X, y = create_sequences(df_real, FEATURES, STEPS, LOOKBACK)
+    X, y = create_sequences(df, FEATURES, STEPS, LOOKBACK)
     split = int(len(X) * 0.85)
 
     X_tr, X_te = X[:split], X[split:]
     y_tr, y_te = y[:split], y[split:]
 
     sx = MinMaxScaler()
-    sx.fit(df_real[FEATURES].iloc[:split + LOOKBACK])
+    sx.fit(df[FEATURES].iloc[:split + LOOKBACK])
 
     def scale_X(X):
-        n,t,f = X.shape
-        return sx.transform(X.reshape(-1,f)).reshape(n,t,f)
+        n, t, f = X.shape
+        return sx.transform(X.reshape(-1, f)).reshape(n, t, f)
 
     X_tr_s = scale_X(X_tr)
     X_te_s = scale_X(X_te)
 
-    model = build_lstm((LOOKBACK,len(FEATURES)), STEPS)
+    model = build_lstm((LOOKBACK, len(FEATURES)), STEPS)
     model.fit(
         X_tr_s, y_tr,
         epochs=50,
@@ -191,20 +232,34 @@ if __name__ == "__main__":
         callbacks=[EarlyStopping(patience=6, restore_best_weights=True)]
     )
 
-    # ===== 未來預測（用 df_pred）=====
+    # ===== 未來預測 =====
     raw_returns = model.predict(X_te_s)[-1]
 
     today = pd.Timestamp(datetime.now().date())
-    last_trade_date = df_real.index[df_real.index < today][-1]
-    last_close = df_real.loc[last_trade_date, "Close"]
+    last_trade_date = df.index[df.index < today][-1]
+    last_close = df.loc[last_trade_date, "Close"]
 
     prices, price = [], last_close
     for r in raw_returns:
         price *= np.exp(r)
         prices.append(price)
 
-    future_df = pd.DataFrame({"Pred_Close": prices})
-    future_df["date"] = pd.bdate_range(last_trade_date + BDay(1), periods=STEPS)
+    seq = df.loc[:last_trade_date, "Close"].iloc[-10:].tolist()
+    future = []
 
-    plot_and_save(df_pred, future_df)
-    plot_backtest_error(df_real, X_te_s, y_te, model, STEPS, split, LOOKBACK)
+    for p in prices:
+        seq.append(p)
+        future.append({
+            "Pred_Close": p,
+            "Pred_MA5": np.mean(seq[-5:]),
+            "Pred_MA10": np.mean(seq[-10:])
+        })
+
+    future_df = pd.DataFrame(future)
+    future_df["date"] = pd.bdate_range(
+        start=last_trade_date + BDay(1),
+        periods=STEPS
+    )
+
+    plot_and_save(df, future_df)
+    plot_backtest_error(df, X_te_s, y_te, model, STEPS, split, LOOKBACK)
