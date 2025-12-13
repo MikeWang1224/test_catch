@@ -5,7 +5,8 @@ FireBase_LSTM_v2.py
 - 不重算指標（避免分佈錯亂）
 - 預測 log return（多步）
 - 價格由 return 還原
-- 畫圖與輸出：完全沿用原版（不動）
+- 原預測圖不動
+- 新增：預測回測誤差圖（Pred vs Actual）
 """
 
 import os, json
@@ -85,7 +86,7 @@ def build_lstm(input_shape, steps):
     m.compile(optimizer="adam", loss="huber")
     return m
 
-# ================= 畫圖（完全不動） =================
+# ================= 原預測圖（完全不動） =================
 def plot_and_save(df_hist, future_df):
     hist = df_hist.tail(10)
 
@@ -136,6 +137,48 @@ def plot_and_save(df_hist, future_df):
                 dpi=300, bbox_inches="tight")
     plt.close()
 
+# ================= 新增：回測誤差圖 =================
+def plot_backtest_error(df, X_te_s, y_te, model, steps):
+    """
+    使用測試集最後一筆，畫 Pred vs Actual
+    """
+    X_last = X_te_s[-1:]
+    y_true = y_te[-1]
+
+    pred_ret = model.predict(X_last)[0]
+
+    start_price = df["Close"].iloc[-steps - 1]
+
+    true_prices = []
+    pred_prices = []
+
+    p_true = start_price
+    p_pred = start_price
+
+    for r_t, r_p in zip(y_true, pred_ret):
+        p_true *= np.exp(r_t)
+        p_pred *= np.exp(r_p)
+        true_prices.append(p_true)
+        pred_prices.append(p_pred)
+
+    mae = np.mean(np.abs(np.array(true_prices) - np.array(pred_prices)))
+    rmse = np.sqrt(np.mean((np.array(true_prices) - np.array(pred_prices)) ** 2))
+
+    plt.figure(figsize=(12,6))
+    plt.plot(true_prices, label="Actual Close")
+    plt.plot(pred_prices, "--o", label="Pred Close")
+    plt.title(f"Backtest Prediction | MAE={mae:.2f}, RMSE={rmse:.2f}")
+    plt.legend()
+    plt.grid(True)
+
+    os.makedirs("results", exist_ok=True)
+    plt.savefig(
+        f"results/{datetime.now():%Y-%m-%d}_backtest.png",
+        dpi=300,
+        bbox_inches="tight"
+    )
+    plt.close()
+
 # ================= Main =================
 if __name__ == "__main__":
     TICKER = "2301.TW"
@@ -145,7 +188,6 @@ if __name__ == "__main__":
     df = load_df_from_firestore(TICKER)
     df = ensure_today_row(df)
 
-    # Firebase 內建指標（不重算）
     FEATURES = [
         "Close",
         "Volume",
@@ -156,7 +198,7 @@ if __name__ == "__main__":
         "ATR_14"
     ]
 
-    # SMA 只為畫圖用
+    # SMA 只為畫圖
     df["SMA5"] = df["Close"].rolling(5).mean()
     df["SMA10"] = df["Close"].rolling(10).mean()
     df = df.dropna()
@@ -165,9 +207,8 @@ if __name__ == "__main__":
     split = int(len(X) * 0.85)
 
     X_tr, X_te = X[:split], X[split:]
-    y_tr = y[:split]
+    y_tr, y_te = y[:split], y[split:]
 
-    # ===== scaler（修正 leakage）=====
     sx = MinMaxScaler()
     sx.fit(df[FEATURES].iloc[:split + LOOKBACK])
 
@@ -187,7 +228,7 @@ if __name__ == "__main__":
         callbacks=[EarlyStopping(patience=6, restore_best_weights=True)]
     )
 
-    # ===== 預測 =====
+    # ===== 預測未來 =====
     raw_returns = model.predict(X_te_s)[-1]
 
     today = pd.Timestamp(datetime.now().date())
@@ -218,3 +259,4 @@ if __name__ == "__main__":
     )
 
     plot_and_save(df, future_df)
+    plot_backtest_error(df, X_te_s, y_te, model, STEPS)
