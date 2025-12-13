@@ -143,12 +143,19 @@ def save_to_firestore(df: pd.DataFrame, ticker="2301.TW", collection="NEW_stock_
     for idx, row in df.iterrows():
         date_str = idx.strftime("%Y-%m-%d")
         payload = {
+            # ===== 行情 =====
+            "Open": float(row["Open"]),
+            "High": float(row["High"]),
+            "Low": float(row["Low"]),
             "Close": float(row["Close"]),
             "Volume": float(row["Volume"]),
+
+            # ===== 指標 =====
             "MACD": float(row["MACD"]),
             "RSI": float(row["RSI"]),
             "K": float(row["K"]),
             "D": float(row["D"]),
+            "ATR_14": float(row["ATR_14"]),
         }
 
         doc_ref = db.collection(collection).document(date_str)
