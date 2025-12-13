@@ -6,7 +6,7 @@ FireBase_LSTM_v2.py
 - 預測 log return（多步）
 - 價格由 return 還原
 - 原預測圖不動
-- 新增：預測回測誤差圖（Pred vs Actual）
+- 回測圖：使用「同一次預測結果」vs Firestore 實際資料
 """
 
 import os, json
@@ -110,25 +110,6 @@ def plot_and_save(df_hist, future_df):
         "r:o", label="Pred Close"
     )
 
-    for i, price in enumerate(future_df["Pred_Close"]):
-        ax.text(x_future[i], price + 0.3, f"{price:.2f}",
-                color="red", fontsize=9, ha="center")
-
-    ax.plot(
-        np.concatenate([[x_hist[-1]], x_future]),
-        [hist["SMA5"].iloc[-1]] + future_df["Pred_MA5"].tolist(),
-        "g--o", label="Pred MA5"
-    )
-
-    ax.plot(
-        np.concatenate([[x_hist[-1]], x_future]),
-        [hist["SMA10"].iloc[-1]] + future_df["Pred_MA10"].tolist(),
-        "b--o", label="Pred MA10"
-    )
-
-    ax.set_xticks(np.arange(len(all_dates)))
-    ax.set_xticklabels(all_dates, rotation=45, ha="right")
-
     ax.legend()
     ax.set_title("2301.TW LSTM 預測（Return-based 穩定版）")
 
@@ -137,41 +118,31 @@ def plot_and_save(df_hist, future_df):
                 dpi=300, bbox_inches="tight")
     plt.close()
 
-# ================= 新增：回測誤差圖 =================
-def plot_backtest_error(df, X_te_s, y_te, model, steps):
+# ================= 回測圖（不再預測） =================
+def plot_backtest_error_from_firestore(df, pred_returns, steps):
     """
-    使用測試集最後一筆，畫 Pred vs Actual（x 軸 = 交易日）
+    使用「當初那次預測的 raw_returns」
+    + Firestore 的實際 Close
     """
-    X_last = X_te_s[-1:]
-    y_true = y_te[-1]
 
-    pred_ret = model.predict(X_last)[0]
-
-    # 對應的實際交易日（最後 steps 天）
     dates = df.index[-steps:]
-
-    # 對應起始價格（回測起點前一天）
     start_price = df.loc[dates[0] - BDay(1), "Close"]
 
-    true_prices = []
     pred_prices = []
+    p = start_price
+    for r in pred_returns[:steps]:
+        p *= np.exp(r)
+        pred_prices.append(p)
 
-    p_true = start_price
-    p_pred = start_price
+    true_prices = df.loc[dates, "Close"].values
 
-    for r_t, r_p in zip(y_true, pred_ret):
-        p_true *= np.exp(r_t)
-        p_pred *= np.exp(r_p)
-        true_prices.append(p_true)
-        pred_prices.append(p_pred)
-
-    mae = np.mean(np.abs(np.array(true_prices) - np.array(pred_prices)))
-    rmse = np.sqrt(np.mean((np.array(true_prices) - np.array(pred_prices)) ** 2))
+    mae = np.mean(np.abs(true_prices - pred_prices))
+    rmse = np.sqrt(np.mean((true_prices - pred_prices) ** 2))
 
     plt.figure(figsize=(12,6))
     plt.plot(dates, true_prices, label="Actual Close")
     plt.plot(dates, pred_prices, "--o", label="Pred Close")
-    plt.title(f"Backtest Prediction | MAE={mae:.2f}, RMSE={rmse:.2f}")
+    plt.title(f"Backtest | MAE={mae:.2f}, RMSE={rmse:.2f}")
     plt.xticks(rotation=45)
     plt.legend()
     plt.grid(True)
@@ -183,7 +154,6 @@ def plot_backtest_error(df, X_te_s, y_te, model, steps):
         bbox_inches="tight"
     )
     plt.close()
-
 
 # ================= Main =================
 if __name__ == "__main__":
@@ -204,7 +174,6 @@ if __name__ == "__main__":
         "ATR_14"
     ]
 
-    # SMA 只為畫圖
     df["SMA5"] = df["Close"].rolling(5).mean()
     df["SMA10"] = df["Close"].rolling(10).mean()
     df = df.dropna()
@@ -234,7 +203,7 @@ if __name__ == "__main__":
         callbacks=[EarlyStopping(patience=6, restore_best_weights=True)]
     )
 
-    # ===== 預測未來 =====
+    # ===== 唯一一次預測 =====
     raw_returns = model.predict(X_te_s)[-1]
 
     today = pd.Timestamp(datetime.now().date())
@@ -242,28 +211,18 @@ if __name__ == "__main__":
     last_close = df.loc[last_trade_date, "Close"]
 
     prices = []
-    price = last_close
+    p = last_close
     for r in raw_returns:
-        price *= np.exp(r)
-        prices.append(price)
+        p *= np.exp(r)
+        prices.append(p)
 
-    seq = df.loc[:last_trade_date, "Close"].iloc[-10:].tolist()
-    future = []
-
-    for p in prices:
-        seq.append(p)
-        future.append({
-            "Pred_Close": p,
-            "Pred_MA5": np.mean(seq[-5:]),
-            "Pred_MA10": np.mean(seq[-10:])
-        })
-
-    future_df = pd.DataFrame(future)
-    future_df["date"] = pd.bdate_range(
-        start=last_trade_date + BDay(1),
-        periods=STEPS
-    )
+    future_df = pd.DataFrame({
+        "Pred_Close": prices,
+        "date": pd.bdate_range(
+            start=last_trade_date + BDay(1),
+            periods=STEPS
+        )
+    })
 
     plot_and_save(df, future_df)
-    plot_backtest_error(df, X_te_s, y_te, model, STEPS)
-    
+    plot_backtest_error_from_firestore(df, raw_returns, STEPS)
