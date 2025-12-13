@@ -125,38 +125,40 @@ def plot_and_save(df_hist, future_df):
     x_hist = np.arange(len(hist_dates))
     x_future = np.arange(len(hist_dates), len(all_dates))
 
-    plt.figure(figsize=(16,8))
+    plt.figure(figsize=(18,8))
+    ax = plt.gca()
 
-    plt.plot(x_hist, hist["Close"], label="Close")
-    plt.plot(x_hist, hist["SMA5"], label="SMA5")
-    plt.plot(x_hist, hist["SMA10"], label="SMA10")
+    # 歷史
+    ax.plot(x_hist, hist["Close"], label="Close")
+    ax.plot(x_hist, hist["SMA5"], label="SMA5")
+    ax.plot(x_hist, hist["SMA10"], label="SMA10")
 
-    plt.plot(
+    # 預測 Close
+    ax.plot(
         np.concatenate([[x_hist[-1]], x_future]),
         [hist["Close"].iloc[-1]] + future_df["Pred_Close"].tolist(),
         "r:o", label="Pred Close"
     )
 
-    plt.plot(
+    # 預測 MA
+    ax.plot(
         np.concatenate([[x_hist[-1]], x_future]),
         [hist["SMA5"].iloc[-1]] + future_df["Pred_MA5"].tolist(),
         "g--o", label="Pred MA5"
     )
 
-    plt.plot(
+    ax.plot(
         np.concatenate([[x_hist[-1]], x_future]),
         [hist["SMA10"].iloc[-1]] + future_df["Pred_MA10"].tolist(),
         "b--o", label="Pred MA10"
     )
 
-    plt.xticks(
-        ticks=np.arange(len(all_dates)),
-        labels=all_dates,
-        rotation=45
-    )
+    # ✅ 關鍵：一天一格（強制）
+    ax.set_xticks(np.arange(len(all_dates)))
+    ax.set_xticklabels(all_dates, rotation=45, ha="right")
 
-    plt.legend()
-    plt.title("2301.TW LSTM 預測（僅交易日，不留白）")
+    ax.legend()
+    ax.set_title("2301.TW LSTM 預測（交易日，一天一格）")
 
     os.makedirs("results", exist_ok=True)
     fname = f"{datetime.now().strftime('%Y-%m-%d')}_pred.png"
