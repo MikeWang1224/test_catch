@@ -140,14 +140,18 @@ def plot_and_save(df_hist, future_df):
 # ================= 新增：回測誤差圖 =================
 def plot_backtest_error(df, X_te_s, y_te, model, steps):
     """
-    使用測試集最後一筆，畫 Pred vs Actual
+    使用測試集最後一筆，畫 Pred vs Actual（x 軸 = 交易日）
     """
     X_last = X_te_s[-1:]
     y_true = y_te[-1]
 
     pred_ret = model.predict(X_last)[0]
 
-    start_price = df["Close"].iloc[-steps - 1]
+    # 對應的實際交易日（最後 steps 天）
+    dates = df.index[-steps:]
+
+    # 對應起始價格（回測起點前一天）
+    start_price = df.loc[dates[0] - BDay(1), "Close"]
 
     true_prices = []
     pred_prices = []
@@ -165,9 +169,10 @@ def plot_backtest_error(df, X_te_s, y_te, model, steps):
     rmse = np.sqrt(np.mean((np.array(true_prices) - np.array(pred_prices)) ** 2))
 
     plt.figure(figsize=(12,6))
-    plt.plot(true_prices, label="Actual Close")
-    plt.plot(pred_prices, "--o", label="Pred Close")
+    plt.plot(dates, true_prices, label="Actual Close")
+    plt.plot(dates, pred_prices, "--o", label="Pred Close")
     plt.title(f"Backtest Prediction | MAE={mae:.2f}, RMSE={rmse:.2f}")
+    plt.xticks(rotation=45)
     plt.legend()
     plt.grid(True)
 
@@ -178,6 +183,7 @@ def plot_backtest_error(df, X_te_s, y_te, model, steps):
         bbox_inches="tight"
     )
     plt.close()
+
 
 # ================= Main =================
 if __name__ == "__main__":
