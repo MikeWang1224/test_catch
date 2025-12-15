@@ -13,6 +13,12 @@ FireBase_Attention_LSTM_Direction.py
 ✅ 改1：修正 scaler fit / split 座標系，避免資料洩漏（leakage）
   - create_sequences 回傳每個樣本對應的日期 idx
   - split 用樣本數切，scaler.fit 只用 train 區間的 df 特徵
+
+✅ 新增：同時輸出 PNG + CSV
+  - results/YYYY-MM-DD_pred.png
+  - results/YYYY-MM-DD_forecast.csv
+  - results/YYYY-MM-DD_backtest.png
+  - results/YYYY-MM-DD_backtest.csv
 """
 
 import os, json
@@ -144,7 +150,8 @@ def build_attention_lstm(input_shape, steps, max_daily_logret=0.06):
             "direction": 0.4
         },
         metrics={
-            "direction": [tf.keras.metrics.BinaryAccuracy(name="acc"), tf.keras.metrics.AUC(name="auc")]
+            "direction": [tf.keras.metrics.BinaryAccuracy(name="acc"),
+                          tf.keras.metrics.AUC(name="auc")]
         }
     )
     return model
@@ -205,7 +212,7 @@ def plot_and_save(df_hist, future_df):
                 dpi=300, bbox_inches="tight")
     plt.close()
 
-# ================= 回測誤差圖（不動） =================
+# ================= 回測誤差圖（PNG + CSV） =================
 def plot_backtest_error(df, X_te_s, y_te, model, steps):
     X_last = X_te_s[-1:]
     y_true = y_te[-1]
@@ -225,9 +232,24 @@ def plot_backtest_error(df, X_te_s, y_te, model, steps):
         true_prices.append(p_true)
         pred_prices.append(p_pred)
 
-    mae = np.mean(np.abs(np.array(true_prices) - np.array(pred_prices)))
-    rmse = np.sqrt(np.mean((np.array(true_prices) - np.array(pred_prices)) ** 2))
+    true_prices = np.array(true_prices, dtype=float)
+    pred_prices = np.array(pred_prices, dtype=float)
 
+    mae = np.mean(np.abs(true_prices - pred_prices))
+    rmse = np.sqrt(np.mean((true_prices - pred_prices) ** 2))
+
+    # ✅ 回測數值輸出 CSV
+    bt_df = pd.DataFrame({
+        "date": pd.to_datetime(dates),
+        "Actual_Close": true_prices,
+        "Pred_Close": pred_prices,
+        "AbsError": np.abs(true_prices - pred_prices),
+    })
+    os.makedirs("results", exist_ok=True)
+    bt_df.to_csv(f"results/{datetime.now():%Y-%m-%d}_backtest.csv",
+                 index=False, encoding="utf-8-sig")
+
+    # 回測圖 PNG（保持原風格）
     plt.figure(figsize=(12,6))
     plt.plot(dates, true_prices, label="Actual Close")
     plt.plot(dates, pred_prices, "--o", label="Pred Close")
@@ -236,7 +258,6 @@ def plot_backtest_error(df, X_te_s, y_te, model, steps):
     plt.legend()
     plt.grid(True)
 
-    os.makedirs("results", exist_ok=True)
     plt.savefig(
         f"results/{datetime.now():%Y-%m-%d}_backtest.png",
         dpi=300,
@@ -258,14 +279,12 @@ if __name__ == "__main__":
 
     df = df.dropna()
 
-    # ✅ 改1：create_sequences 回傳 idx（樣本對應日期）
     X, y_ret, y_dir, idx = create_sequences(df, FEATURES, steps=STEPS, window=LOOKBACK)
     print(f"df rows: {len(df)} | X samples: {len(X)}")
 
     if len(X) < 40:
         raise ValueError("⚠️ 可用序列太少（<40）。建議：降低 LOOKBACK/STEPS 或檢查資料是否缺欄位/過多 NaN。")
 
-    # ✅ split 用樣本數切（不再拿去推 df 的 iloc）
     split = int(len(X) * 0.85)
 
     X_tr, X_te = X[:split], X[split:]
@@ -273,7 +292,7 @@ if __name__ == "__main__":
     y_dir_tr, y_dir_te = y_dir[:split], y_dir[split:]
     idx_tr, idx_te = idx[:split], idx[split:]
 
-    # ✅ 改1：scaler.fit 僅用 train 區間（用 idx_tr 的最後日期界定）
+    # ✅ scaler.fit 僅用 train 區間（用 idx_tr 的最後日期界定）
     train_end_date = pd.Timestamp(idx_tr[-1])
     df_for_scaler = df.loc[:train_end_date, FEATURES].copy()
 
@@ -290,7 +309,6 @@ if __name__ == "__main__":
     X_tr_s = scale_X(X_tr)
     X_te_s = scale_X(X_te)
 
-    # ✅ max_daily_logret 可調：更保守 0.04~0.05
     model = build_attention_lstm(
         (LOOKBACK, len(FEATURES)),
         STEPS,
@@ -335,6 +353,11 @@ if __name__ == "__main__":
         start=df.index.max() + BDay(1),
         periods=STEPS
     )
+
+    # ✅ 預測數值輸出 CSV（隔天要疊今日實際用這份）
+    os.makedirs("results", exist_ok=True)
+    future_df.to_csv(f"results/{datetime.now():%Y-%m-%d}_forecast.csv",
+                     index=False, encoding="utf-8-sig")
 
     plot_and_save(df, future_df)
     plot_backtest_error(df, X_te_s, y_ret_te, model, STEPS)
