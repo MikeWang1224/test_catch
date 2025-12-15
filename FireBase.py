@@ -87,12 +87,16 @@ def weighted_huber_loss(steps):
         (1, steps)
     )
 
+    huber = tf.keras.losses.Huber(
+        reduction=tf.keras.losses.Reduction.NONE
+    )
+
     def loss(y_true, y_pred):
-        err = tf.keras.losses.huber(y_true, y_pred)  # (batch, steps)
+        # (batch, steps)
+        err = huber(y_true, y_pred)
         return tf.reduce_mean(err * weights)
 
     return loss
-
 
 # ================= LSTM（雙層） =================
 def build_lstm(input_shape, steps):
