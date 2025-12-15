@@ -256,6 +256,7 @@ if __name__ == "__main__":
 
     pred_ret, pred_dir = model.predict(X_te_s, verbose=0)
     raw_returns = pred_ret[-1]
+    raw_returns = np.clip(raw_returns, -0.03, 0.03) 
 
     print(f"📈 預測方向機率（看漲）: {pred_dir[-1][0]:.2%}")
 
