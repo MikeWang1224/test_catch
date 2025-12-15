@@ -4,10 +4,12 @@ FireBase_Transformer_Direction.py
 - Transformer Encoder (MultiHeadAttention)
 - Multi-task: Return path + Direction
 - ✅ 小資料友善版：更穩、更不容易亂噴
-  1) LOOKBACK=40, STEPS=5（樣本變多、短期更穩）
+  1) LOOKBACK=40, STEPS=5
   2) Transformer 變小（d_model=32, heads=2, depth=1, dropout=0.2）
-  3) Walk-forward：folds=2 + 固定 val_len=25（資料少更穩）
-  4) features 減肥（小資料避免噪音）：log_ret / hl_range / gap / Volume / ATR_14
+  3) Walk-forward：folds=2 + 固定 val_len=25
+  4) features 減肥：log_ret / hl_range / gap / Volume / ATR_14
+  5) ✅ 核心修正：Return head 加 tanh 限幅（避免預測爆炸）
+  6) ✅ Volume 做 log1p（小資料更穩）
 - 圖表輸出完全不變（保留 Today 標記）
 """
 
@@ -22,7 +24,7 @@ from sklearn.preprocessing import MinMaxScaler
 import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
-    Input, Dense, Dropout,
+    Input, Dense, Dropout, Lambda,
     LayerNormalization, MultiHeadAttention, Add, GlobalAveragePooling1D
 )
 from tensorflow.keras.callbacks import EarlyStopping
@@ -71,7 +73,11 @@ def ensure_today_row(df):
 
 # ================= Feature Engineering =================
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
-    # 相對/報酬特徵（主流、也較穩）
+    # ✅ Volume 尺度穩定（很重要：小資料避免極端值主宰）
+    if "Volume" in df.columns:
+        df["Volume"] = np.log1p(df["Volume"].astype(float))
+
+    # 相對/報酬特徵
     df["log_ret"]  = np.log(df["Close"]).diff()
     df["oc_ret"]   = np.log(df["Close"] / df["Open"])
     df["hl_range"] = (df["High"] - df["Low"]) / df["Close"]
@@ -120,9 +126,12 @@ def transformer_block(x, d_model, num_heads, ff_dim, dropout=0.2):
     x = LayerNormalization(epsilon=1e-6)(x)
     return x
 
-# ================= Model（小資料友善：更小、更強 dropout） =================
-def build_transformer_model(input_shape, steps,
-                            d_model=32, num_heads=2, ff_dim=64, depth=1, dropout=0.2):
+# ================= Model（小資料友善 + ✅ return 限幅避免爆炸） =================
+def build_transformer_model(
+    input_shape, steps,
+    d_model=32, num_heads=2, ff_dim=64, depth=1, dropout=0.2,
+    max_daily_logret=0.06  # ✅ 單日 log-return 最大幅度（可調：0.04~0.08 常見）
+):
     inp = Input(shape=input_shape)
     x = Dense(d_model)(inp)
 
@@ -132,12 +141,15 @@ def build_transformer_model(input_shape, steps,
     context = GlobalAveragePooling1D()(x)
     context = Dropout(dropout)(context)
 
-    out_ret = Dense(steps, name="return")(context)
+    # ✅ 核心：把 return head 限在 [-max_daily_logret, +max_daily_logret]
+    raw = Dense(steps, activation="tanh")(context)  # [-1, 1]
+    out_ret = Lambda(lambda t: t * max_daily_logret, name="return")(raw)
+
     out_dir = Dense(1, activation="sigmoid", name="direction")(context)
 
     model = Model(inp, [out_ret, out_dir])
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=7e-4),  # 稍微小一點更穩
+        optimizer=tf.keras.optimizers.Adam(learning_rate=7e-4),
         loss={
             "return": tf.keras.losses.Huber(),
             "direction": "binary_crossentropy"
@@ -260,9 +272,7 @@ def walk_forward_evaluate(
     if n < (val_len * 3):
         print("⚠️ 可用序列真的偏少，walk-forward 只做極少 fold 會比較合理。")
 
-    # 起始訓練長度
     start_train_end = max(int(n * train_min), lookback + 10)
-    # 每折往後推進的距離
     max_train_end = n - val_len - 1
     if max_train_end <= start_train_end:
         start_train_end = max(n - val_len - 1, lookback + 10)
@@ -278,7 +288,6 @@ def walk_forward_evaluate(
         y_ret_tr, y_ret_va = y_ret[tr_slice], y_ret[va_slice]
         y_dir_tr, y_dir_va = y_dir[tr_slice], y_dir[va_slice]
 
-        # scaler：只 fit 在 train 範圍（保守）
         fit_end = min(train_end + lookback, len(features_df_for_scaler))
         sx = MinMaxScaler()
         sx.fit(features_df_for_scaler[features].iloc[:fit_end])
@@ -295,8 +304,8 @@ def walk_forward_evaluate(
         model.fit(
             X_tr_s,
             {"return": y_ret_tr, "direction": y_dir_tr},
-            epochs=60,                    # 小資料多給 epoch，靠 early stop
-            batch_size=16,                # 小資料 batch 小一點較穩
+            epochs=60,
+            batch_size=16,
             verbose=0,
             callbacks=[EarlyStopping(patience=8, restore_best_weights=True)]
         )
@@ -325,7 +334,6 @@ def walk_forward_evaluate(
 if __name__ == "__main__":
     TICKER = "2301.TW"
 
-    # ✅ 小資料友善設定
     LOOKBACK = 40
     STEPS = 5
 
@@ -333,7 +341,6 @@ if __name__ == "__main__":
     df = ensure_today_row(df)
     df = add_features(df)
 
-    # ✅ 小資料：特徵減肥（先穩再說）
     FEATURES = [
         "log_ret", "hl_range", "gap",
         "Volume", "ATR_14"
@@ -345,9 +352,9 @@ if __name__ == "__main__":
     print(f"df rows: {len(df)} | X samples: {len(X)}")
 
     if len(X) < 40:
-        raise ValueError("⚠️ 可用序列太少（<40）。建議：降低 LOOKBACK/STE��S，或檢查資料是否缺欄位/過多 NaN。")
+        raise ValueError("⚠️ 可用序列太少（<40）。建議：降低 LOOKBACK/STEPS，或檢查資料是否缺欄位/過多 NaN。")
 
-    # ========= Walk-forward（小資料友善） =========
+    # ========= Walk-forward =========
     walk_forward_evaluate(
         X, y_ret, y_dir,
         features_df_for_scaler=df,
@@ -359,7 +366,7 @@ if __name__ == "__main__":
         train_min=0.70
     )
 
-    # ========= 最終模型：用最後 15% 當 test（保留你原本流程，方便出圖） =========
+    # ========= 最終模型：用最後 15% 當 test =========
     split = int(len(X) * 0.85)
     X_tr, X_te = X[:split], X[split:]
     y_ret_tr, y_ret_te = y_ret[:split], y_ret[split:]
@@ -375,8 +382,12 @@ if __name__ == "__main__":
     X_tr_s = scale_X(X_tr)
     X_te_s = scale_X(X_te)
 
-    model = build_transformer_model((LOOKBACK, len(FEATURES)), STEPS,
-                                    d_model=32, num_heads=2, ff_dim=64, depth=1, dropout=0.2)
+    # ✅ 這裡可調 max_daily_logret：想更保守就 0.04~0.05
+    model = build_transformer_model(
+        (LOOKBACK, len(FEATURES)), STEPS,
+        d_model=32, num_heads=2, ff_dim=64, depth=1, dropout=0.2,
+        max_daily_logret=0.06
+    )
 
     model.fit(
         X_tr_s,
@@ -388,11 +399,10 @@ if __name__ == "__main__":
     )
 
     pred_ret, pred_dir = model.predict(X_te_s, verbose=0)
-    raw_returns = pred_ret[-1]  # ✅ 不 clip（但模型更小+短 horizon，會自然穩很多）
+    raw_returns = pred_ret[-1]  # ✅ 已被結構性限幅，不會爆炸
 
     print(f"📈 預測方向機率（看漲）: {pred_dir[-1][0]:.2%}")
 
-    # ✅ 用 df 最後一天作為「今天/最新基準日」（包含 today）
     asof_date = df.index.max()
     last_close = float(df.loc[asof_date, "Close"])
 
