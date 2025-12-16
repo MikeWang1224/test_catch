@@ -2,6 +2,7 @@
 """
 個股資料抓取 + 技術指標計算 + Firestore 更新與寫回
 ✅ 今日 Close 先覆寫，再重新計算指標（一致性修正版）
+➕ 加入加權指數 / 電子指數（Close only）
 不含模型、不含預測、不含繪圖
 """
 
@@ -32,13 +33,11 @@ else:
 def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # ===== SMA =====
     df["SMA_5"] = df["Close"].rolling(5).mean()
     df["SMA_10"] = df["Close"].rolling(10).mean()
     df["SMA_20"] = df["Close"].rolling(20).mean()
     df["SMA_50"] = df["Close"].rolling(50).mean()
 
-    # ===== RSI (20) =====
     delta = df["Close"].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -47,24 +46,20 @@ def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     rs = avg_gain / avg_loss
     df["RSI"] = 100 - (100 / (1 + rs))
 
-    # ===== KD (14,3) =====
     low14 = df["Low"].rolling(14).min()
     high14 = df["High"].rolling(14).max()
     denom = high14 - low14
     df["K"] = np.where(denom == 0, 50.0, 100 * (df["Close"] - low14) / denom)
     df["D"] = df["K"].rolling(3).mean()
 
-    # ===== MACD (12,26,9) =====
     ema12 = df["Close"].ewm(span=12, adjust=False).mean()
     ema26 = df["Close"].ewm(span=26, adjust=False).mean()
     df["MACD"] = ema12 - ema26
     df["SignalLine"] = df["MACD"].ewm(span=9, adjust=False).mean()
 
-    # ===== 報酬率 =====
     df["RET_1"] = df["Close"].pct_change()
     df["LOG_RET_1"] = np.log(df["Close"] / df["Close"].shift(1))
 
-    # ===== ATR (14) =====
     tr = pd.concat([
         df["High"] - df["Low"],
         (df["High"] - df["Close"].shift()).abs(),
@@ -72,7 +67,6 @@ def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1).max(axis=1)
     df["ATR_14"] = tr.rolling(14).mean()
 
-    # ===== Bollinger Band =====
     mid = df["Close"].rolling(20).mean()
     std = df["Close"].rolling(20).std()
     df["BB_mid"] = mid
@@ -80,7 +74,6 @@ def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["BB_lower"] = mid - 2 * std
     df["BB_width"] = (df["BB_upper"] - df["BB_lower"]) / mid
 
-    # ===== OBV =====
     obv = [0]
     for i in range(1, len(df)):
         if df["Close"].iloc[i] > df["Close"].iloc[i - 1]:
@@ -92,13 +85,12 @@ def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["OBV"] = obv
     df["OBV_SMA_20"] = df["OBV"].rolling(20).mean()
 
-    # ===== 量能 =====
     df["Vol_SMA_5"] = df["Volume"].rolling(5).mean()
     df["Vol_SMA_20"] = df["Volume"].rolling(20).mean()
 
     return df.dropna()
 
-# ---------------- Firestore 覆寫今日 Close（只改 Close） ----------------
+# ---------------- Firestore 覆寫今日 Close ----------------
 def overwrite_today_close(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     if db is None:
         return df
@@ -118,65 +110,59 @@ def overwrite_today_close(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
 
     return df
 
-# ---------------- 抓資料主流程 ----------------
+# ---------------- 抓個股 ----------------
 def fetch_prepare_recalc(ticker="2301.TW", period="12mo") -> pd.DataFrame:
-    stock = yf.Ticker(ticker)
-    df = stock.history(period=period)
-
-    # ① 先覆寫 Close
+    df = yf.Ticker(ticker).history(period=period)
     df = overwrite_today_close(df, ticker)
-
-    # ② 再重新計算所有指標（關鍵修正）
     df = add_all_indicators(df)
-
     return df
 
-# ---------------- Firestore 寫回 ----------------
+# ---------------- Firestore 寫個股 ----------------
 def save_to_firestore(df: pd.DataFrame, ticker="2301.TW", collection="NEW_stock_data_liteon"):
     if db is None:
-        print("⚠️ FIREBASE 未啟用，略過寫入")
         return
 
     batch = db.batch()
-    count = 0
-
     for idx, row in df.iterrows():
         date_str = idx.strftime("%Y-%m-%d")
         payload = {
-            # ===== 行情 =====
             "Open": float(row["Open"]),
             "High": float(row["High"]),
             "Low": float(row["Low"]),
             "Close": float(row["Close"]),
             "Volume": float(row["Volume"]),
-
-            # ===== 指標 =====
             "MACD": float(row["MACD"]),
             "RSI": float(row["RSI"]),
             "K": float(row["K"]),
             "D": float(row["D"]),
             "ATR_14": float(row["ATR_14"]),
         }
-
         doc_ref = db.collection(collection).document(date_str)
         batch.set(doc_ref, {ticker: payload}, merge=True)
 
-        count += 1
-        if count >= 300:
-            batch.commit()
-            batch = db.batch()
-            count = 0
+    batch.commit()
+    print(f"🔥 Firestore 寫入完成：{ticker}")
 
-    if count > 0:
-        batch.commit()
+# ---------------- ➕ 指數抓取（Close only） ----------------
+def save_index_close(ticker: str, alias: str, period="12mo"):
+    if db is None:
+        return
 
-    print(f"🔥 Firestore 寫入完成：{collection}")
+    df = yf.Ticker(ticker).history(period=period)
+    for idx, row in df.iterrows():
+        date_str = idx.strftime("%Y-%m-%d")
+        doc_ref = db.collection("NEW_stock_data_liteon").document(date_str)
+        doc_ref.set({alias: {"Close": float(row["Close"])}}, merge=True)
+
+    print(f"🔥 指數寫入完成：{alias}")
 
 # ---------------- Main ----------------
 if __name__ == "__main__":
-    TICKER = "2301.TW"
+    df = fetch_prepare_recalc("2301.TW")
+    save_to_firestore(df, "2301.TW")
 
-    df = fetch_prepare_recalc(TICKER)
-    save_to_firestore(df, TICKER)
+    # ➕ 加權指數 / 電子指數
+    save_index_close("^TWII", "TAIEX")
+    save_index_close("^TWTE", "ELECTRONICS")
 
     print(df.tail())
