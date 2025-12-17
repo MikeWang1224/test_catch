@@ -2,15 +2,17 @@ name: Run Liteon Stock Program
 
 on:
   push:
-    branches: 
+    branches:
       - main
   schedule:
     # 每天 UTC 05:50 = 台灣時間 13:50
-    - cron: '50 5 * * *' 
+    - cron: '50 5 * * *'
   workflow_dispatch:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 jobs:
   run_program:
@@ -38,26 +40,34 @@ jobs:
             scikit-learn \
             tensorflow
 
-      # ---------------- 先抓股價 + 技術指標 ----------------
-      - name: Run stock data collection (catch_stock.py)
+      # ----------- 抓股價 ----------
+      - name: Run stock data collection
         env:
           FIREBASE: ${{ secrets.FIREBASE }}
-        run: |
-          python catch_stock.py
+        run: python catch_stock.py
 
-      # ---------------- 再跑 LSTM / 預測 / 繪圖 ----------------
-      - name: Run stock prediction program (FireBase.py)
+      # ----------- 預測 + 繪圖 ----------
+      - name: Run stock prediction
         env:
           FIREBASE: ${{ secrets.FIREBASE }}
-        run: |
-          python FireBase.py
+        run: python FireBase.py
 
-      # ---------------- Commit 圖表結果 ----------------
-      - name: Commit & push result chart
+      # ----------- 組 Pages site ----------
+      - name: Prepare GitHub Pages site
         run: |
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
-          git add results/*.png
-          git add results/*.csv
-          git commit -m "Update Liteon stock chart" || echo "No changes to commit"
-          git push
+          mkdir -p site/results
+          cp index.html site/index.html
+          cp -r results/* site/results/
+
+      # ----------- 上傳 Pages artifact ----------
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy_pages:
+    needs: run_program
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
