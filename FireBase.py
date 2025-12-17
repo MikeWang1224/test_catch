@@ -239,16 +239,15 @@ def plot_backtest_error(df):
     used_csv = None
 
     for fname in csv_files:
-        path = os.path.join("results", fname)
-        tmp = pd.read_csv(path, parse_dates=["date"])
-        if tmp.empty:
-            continue
+    date_str = fname.split("_")[0]          # 2025-12-16
+    file_date = pd.to_datetime(date_str)
 
-        # 必須是「不包含今日」的預測
-        if tmp["date"].iloc[0] < today:
-            fc = tmp
-            used_csv = fname
-            break
+    if file_date < today:
+        path = os.path.join("results", fname)
+        fc = pd.read_csv(path, parse_dates=["date"])
+        used_csv = fname
+        break
+
 
     if fc is None:
         print("⚠️ 找不到任何『不包含今日』的 forecast CSV，略過回測圖")
