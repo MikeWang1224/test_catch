@@ -212,31 +212,12 @@ def plot_and_save(df_hist, future_df):
                 dpi=300, bbox_inches="tight")
     plt.close()
 
-
-
-def pick_forecast_csv(results_dir="results"):
-    today = pd.Timestamp(datetime.now().date())
-
-    csvs = sorted(
-        [f for f in os.listdir(results_dir) if f.endswith("_forecast.csv")],
-        reverse=True
-    )
-
-    for f in csvs:
-        path = os.path.join(results_dir, f)
-
-        try:
-            head = pd.read_csv(path, nrows=1, parse_dates=["asof_date"])
-        except Exception:
-            continue
-
-        asof = pd.Timestamp(head.loc[0, "asof_date"])
-
-        # ✅ 關鍵判斷：只用「基準日 < 今天」的 forecast
-        if asof < today:
-            return path
-
-    return None
+# ================= 回測誤差圖（PNG + CSV） =================
+# -*- coding: utf-8 -*-
+"""
+FireBase_Attention_LSTM_Direction.py
+（中略：前面完全不動）
+"""
 
 # ================= 回測決策分岔圖（PNG + CSV） =================
 def plot_backtest_error(df):
@@ -249,18 +230,29 @@ def plot_backtest_error(df):
         t → Pred(t+1)
         t → Actual(t+1)
     """
-    # ================= 找可用的 forecast（避開今天） =================
-    if not os.path.exists("results"):
-      print("⚠️ 無 results 資料夾，略過回測")
-      return
-    
-    forecast_csv = pick_forecast_csv("results")
-    
-    if forecast_csv is None:
-      print("⚠️ 無可用 forecast，略過回測")
-      return
-    
 
+    today = pd.Timestamp(datetime.now().date())
+
+    # ================= 找昨天的 forecast =================
+    if not os.path.exists("results"):
+        print("⚠️ 無 results 資料夾，略過回測")
+        return
+
+    csvs = sorted(
+        [f for f in os.listdir("results") if f.endswith("_forecast.csv")],
+        reverse=True
+    )
+
+    forecast_csv = None
+    for f in csvs:
+        d = pd.to_datetime(f.split("_")[0])
+        if d < today:
+            forecast_csv = os.path.join("results", f)
+            break
+
+    if forecast_csv is None:
+        print("⚠️ 找不到昨日 forecast，略過回測")
+        return
 
     future_df = pd.read_csv(forecast_csv, parse_dates=["date"])
 
@@ -446,7 +438,6 @@ if __name__ == "__main__":
 
     # ✅ 預測數值輸出 CSV（隔天要疊今日實際用這份）
     os.makedirs("results", exist_ok=True)
-    future_df["asof_date"] = asof_date
     future_df.to_csv(f"results/{datetime.now():%Y-%m-%d}_forecast.csv",
                      index=False, encoding="utf-8-sig")
 
