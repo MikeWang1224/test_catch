@@ -279,13 +279,18 @@ def plot_backtest_error(df):
     x_trend = np.arange(len(trend))
     x_t = x_trend[-1]
 
-    # ================= 畫圖 =================
+       # ================= 畫圖 =================
     plt.figure(figsize=(14, 6))
     ax = plt.gca()
-
+    
     # 最近收盤趨勢
-    ax.plot(x_trend, trend["Close"], "k-o", label="Recent Close")
-
+    ax.plot(
+        x_trend,
+        trend["Close"],
+        "k-o",
+        label="Recent Close"
+    )
+    
     # Pred 線
     ax.plot(
         [x_t, x_t + 1],
@@ -294,7 +299,7 @@ def plot_backtest_error(df):
         linewidth=2.5,
         label="Pred (t → t+1)"
     )
-
+    
     # Actual 線
     ax.plot(
         [x_t, x_t + 1],
@@ -303,40 +308,64 @@ def plot_backtest_error(df):
         linewidth=2.5,
         label="Actual (t → t+1)"
     )
-
-    # 數值標註
-    ax.text(x_t, close_t + 0.2, f"{close_t:.2f}", ha="center")
+    
+    # ================= 數值標註（全部統一在點右邊） =================
+    dx = 0.08  # X 方向右移量
+    
+    # t 日 Close
     ax.text(
-        x_t + 1, pred_t1 + 0.2,
-        f"Pred\n{pred_t1:.2f}",
-        color="red", ha="center"
+        x_t + dx,
+        close_t,
+        f"{close_t:.2f}",
+        ha="left",
+        va="center",
+        fontsize=10,
+        color="black"
     )
+    
+    # Pred t+1
     ax.text(
-        x_t + 1, actual_t1 - 0.4,
-        f"Actual\n{actual_t1:.2f}",
-        color="green", ha="center"
+        x_t + 1 + dx,
+        pred_t1,
+        f"Pred {pred_t1:.2f}",
+        ha="left",
+        va="center",
+        fontsize=10,
+        color="red"
     )
-
-    # X 軸
+    
+    # Actual t+1
+    ax.text(
+        x_t + 1 + dx,
+        actual_t1,
+        f"Actual {actual_t1:.2f}",
+        ha="left",
+        va="center",
+        fontsize=10,
+        color="green"
+    )
+    
+    # ================= X 軸 =================
     labels = trend.index.strftime("%m-%d").tolist()
-    labels.append(t1.strftime("%m-%d"))  # ✅ 實際日期
+    labels.append(t1.strftime("%m-%d"))
     ax.set_xticks(np.arange(len(labels)))
     ax.set_xticklabels(labels)
-
-
+    
     ax.set_title("2301.TW Decision Backtest (t → t+1)")
     ax.legend()
     ax.grid(alpha=0.3)
-
-    # ================= 🔑 Run timestamp（保證每次 PNG 都不同） =================
+    
+    # ================= Run timestamp =================
     ax.text(
         0.01, 0.01,
         f"Generated at {datetime.now():%Y-%m-%d %H:%M:%S}",
         transform=ax.transAxes,
         fontsize=8,
         alpha=0.4,
-        ha="left", va="bottom"
+        ha="left",
+        va="bottom"
     )
+
 
     # ================= 儲存 =================
     os.makedirs("results", exist_ok=True)
