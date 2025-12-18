@@ -216,10 +216,10 @@ def plot_backtest_error(df):
     """
     決策式回測圖（Decision-based Backtest）
 
-    規則：
-    - 自動排除「今天」的 forecast
-    - 使用日期最近的一筆歷史 forecast
-    - 同一天重跑結果完全一致
+    修正重點：
+    1) 排除今天 forecast，自動找最近一筆
+    2) 不使用 df.index.max() - BDay(1)（避免假今日資料）
+    3) 永遠使用最後一個「真實交易日」當決策日
     """
 
     today = pd.Timestamp(datetime.now().date())
@@ -238,15 +238,13 @@ def plot_backtest_error(df):
         except Exception:
             continue
 
-        # ✅ 關鍵：明確排除今天
-        if d < today:
+        if d < today:  # ✅ 明確排除今天
             forecast_files.append((d, f))
 
     if not forecast_files:
         print("⚠️ 找不到可用的歷史 forecast（已排除今天）")
         return
 
-    # 取日期最近的一筆
     forecast_files.sort(key=lambda x: x[0], reverse=True)
     forecast_date, forecast_name = forecast_files[0]
     forecast_csv = os.path.join("results", forecast_name)
@@ -255,18 +253,20 @@ def plot_backtest_error(df):
 
     future_df = pd.read_csv(forecast_csv, parse_dates=["date"])
 
-    # ================= 定義決策日 t =================
-    t = df.index.max() - BDay(1)
+    # ================= 決策日 t（最後一個真實交易日） =================
+    valid_days = df.index[df.index < today]
 
-    if t not in df.index:
-        print("⚠️ 決策日不存在，略過回測")
+    if len(valid_days) < 2:
+        print("⚠️ 無足夠歷史交易日，略過回測")
         return
+
+    t = valid_days[-1]          # 最後一個真實交易日
+    t1 = valid_days[-1] + BDay(1)
 
     # ================= 價格 =================
     close_t = float(df.loc[t, "Close"])
     pred_t1 = float(future_df.loc[0, "Pred_Close"])
 
-    t1 = t + BDay(1)
     if t1 in df.index:
         actual_t1 = float(df.loc[t1, "Close"])
     else:
@@ -281,10 +281,8 @@ def plot_backtest_error(df):
     plt.figure(figsize=(14, 6))
     ax = plt.gca()
 
-    # 趨勢線
     ax.plot(x_trend, trend["Close"], "k-o", label="Recent Close")
 
-    # Pred 線
     ax.plot(
         [x_t, x_t + 1],
         [close_t, pred_t1],
@@ -293,7 +291,6 @@ def plot_backtest_error(df):
         label="Pred (t → t+1)"
     )
 
-    # Actual 線
     ax.plot(
         [x_t, x_t + 1],
         [close_t, actual_t1],
@@ -302,16 +299,13 @@ def plot_backtest_error(df):
         label="Actual (t → t+1)"
     )
 
-    # 標註
     ax.text(x_t, close_t + 0.2, f"{close_t:.2f}", ha="center")
     ax.text(x_t + 1, pred_t1 + 0.2, f"Pred\n{pred_t1:.2f}",
             color="red", ha="center")
     ax.text(x_t + 1, actual_t1 - 0.4, f"Actual\n{actual_t1:.2f}",
             color="green", ha="center")
 
-    # X 軸
-    labels = trend.index.strftime("%m-%d").tolist()
-    labels += ["t+1"]
+    labels = trend.index.strftime("%m-%d").tolist() + ["t+1"]
     ax.set_xticks(np.arange(len(labels)))
     ax.set_xticklabels(labels)
 
@@ -320,6 +314,8 @@ def plot_backtest_error(df):
     ax.grid(alpha=0.3)
 
     os.makedirs("results", exist_ok=True)
+
+    print(f"🖼️ 儲存 backtest 圖：{today:%Y-%m-%d}_backtest.png")
     plt.savefig(
         f"results/{today:%Y-%m-%d}_backtest.png",
         dpi=300,
@@ -343,7 +339,6 @@ def plot_backtest_error(df):
         index=False,
         encoding="utf-8-sig"
     )
-
 
 # ================= Main =================
 if __name__ == "__main__":
