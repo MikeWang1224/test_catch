@@ -317,8 +317,7 @@ def plot_backtest_error(df):
         x_t + dx,
         close_t,
         f"{close_t:.2f}",
-        ha="center",
-        va="center",
+        va="top",
         fontsize=10,
         color="black"
     )
