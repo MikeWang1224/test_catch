@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FireBase_Attention_LSTM_Direction.py
+FireBase_Attention_LSTM_Direction.py (2408.TW 南亞科｜方向更準版)
 - Attention-LSTM
 - Multi-task: Return path + Direction
 - ✅ 小資料友善版：更穩、更不容易亂噴
@@ -8,20 +8,25 @@ FireBase_Attention_LSTM_Direction.py
   2) LSTM + Attention pooling（參數比 Transformer 更適合小資料）
   3) ✅ Return head 加 tanh 限幅（避免預測爆炸）
   4) ✅ Volume 做 log1p（小資料更穩）
-- 圖表輸出完全不變（保留 Today 標記）
 
-✅ 改1：修正 scaler fit / split 座標系，避免資料洩漏（leakage）
-  - create_sequences 回傳每個樣本對應的日期 idx
-  - split 用樣本數切，scaler.fit 只用 train 區間的 df 特徵
+✅ 防資料洩漏：
+  - create_sequences 回傳每個樣本對應日期 idx
+  - split 用樣本數切，scaler.fit 只用 train 區間 df 特徵
 
-✅ 新增：同時輸出 PNG + CSV（檔名加 ticker，避免覆蓋）
+✅ 輸出檔名加 ticker（避免覆蓋）：
   - results/YYYY-MM-DD_<TICKER>_pred.png
   - results/YYYY-MM-DD_<TICKER>_forecast.csv
   - results/YYYY-MM-DD_<TICKER>_backtest.png
   - results/YYYY-MM-DD_<TICKER>_backtest.csv
+
+✅ 本次「方向更準」重點改動：
+  A) max_daily_logret 自動化：train |logret| 的 99% 分位 + clip [0.03, 0.10]
+  B) direction loss weight：0.8（更偏方向）
+  C) ✅ 加入「模型存檔 / 載入續訓」：避免每天從頭訓練造成結果飄（通常方向更穩、更準）
+  D) 加 seed：結果更可比較
 """
 
-import os, json
+import os, json, random
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -29,16 +34,20 @@ import matplotlib.pyplot as plt
 from pandas.tseries.offsets import BDay
 
 from sklearn.preprocessing import MinMaxScaler
+
 import tensorflow as tf
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import (
-    Input, LSTM, Dense, Dropout,
-    Softmax, Lambda
-)
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.layers import Input, LSTM, Dense, Dropout, Softmax, Lambda
 from tensorflow.keras.callbacks import EarlyStopping
 
 from zoneinfo import ZoneInfo
 now_tw = datetime.now(ZoneInfo("Asia/Taipei"))
+
+# ================= Seed（讓結果更穩、可比較） =================
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
 
 # Firebase
 import firebase_admin
@@ -55,6 +64,8 @@ if key_dict:
     except Exception:
         firebase_admin.initialize_app(cred)
     db = firestore.client()
+else:
+    print("⚠️ FIREBASE 未設定，Firestore 讀取將無資料")
 
 # ================= Firestore 讀取 =================
 def load_df_from_firestore(ticker, collection="NEW_stock_data_liteon", days=500):
@@ -98,7 +109,7 @@ def create_sequences(df, features, steps=5, window=40):
     """
     X: t-window ~ t-1
     y_ret: t ~ t+steps-1 的 log return
-    y_dir: 未來 steps 天累積方向
+    y_dir: 未來 steps 天累積方向（sum future_ret > 0）
     idx: 每個樣本對應的「t 當天日期」
     """
     X, y_ret, y_dir, idx = [], [], [], []
@@ -110,8 +121,10 @@ def create_sequences(df, features, steps=5, window=40):
     for i in range(window, len(df) - steps):
         x_seq = feat[i - window:i]
         future_ret = logret.iloc[i:i + steps].values
+
         if np.any(np.isnan(future_ret)) or np.any(np.isnan(x_seq)):
             continue
+
         X.append(x_seq)
         y_ret.append(future_ret)
         y_dir.append(1.0 if future_ret.sum() > 0 else 0.0)
@@ -119,7 +132,7 @@ def create_sequences(df, features, steps=5, window=40):
 
     return np.array(X), np.array(y_ret), np.array(y_dir), np.array(idx)
 
-# ================= Attention-LSTM（✅ return 限幅） =================
+# ================= Model build（return 限幅） =================
 def build_attention_lstm(input_shape, steps, max_daily_logret=0.06):
     inp = Input(shape=input_shape)
 
@@ -137,19 +150,24 @@ def build_attention_lstm(input_shape, steps, max_daily_logret=0.06):
     out_dir = Dense(1, activation="sigmoid", name="direction")(context)
 
     model = Model(inp, [out_ret, out_dir])
+    return model
+
+def compile_model(model, direction_weight=0.8, lr=7e-4):
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=7e-4),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
         loss={
             "return": tf.keras.losses.Huber(),
             "direction": "binary_crossentropy"
         },
         loss_weights={
             "return": 1.0,
-            "direction": 0.4
+            "direction": float(direction_weight)
         },
         metrics={
-            "direction": [tf.keras.metrics.BinaryAccuracy(name="acc"),
-                          tf.keras.metrics.AUC(name="auc")]
+            "direction": [
+                tf.keras.metrics.BinaryAccuracy(name="acc"),
+                tf.keras.metrics.AUC(name="auc")
+            ]
         }
     )
     return model
@@ -217,7 +235,6 @@ def plot_backtest_error(df, ticker):
         print("⚠️ 無 results 資料夾，略過回測")
         return
 
-    # 只找該 ticker 的 forecast
     suffix = f"_{ticker}_forecast.csv"
     forecast_files = []
     for f in os.listdir("results"):
@@ -265,10 +282,8 @@ def plot_backtest_error(df, ticker):
     ax = plt.gca()
 
     ax.plot(x_trend, trend["Close"], "k-o", label="Recent Close")
-
     ax.plot([x_t, x_t + 1], [close_t, pred_t1], "r--o",
             linewidth=2.5, label="Pred (t → t+1)")
-
     ax.plot([x_t, x_t + 1], [close_t, actual_t1], "g-o",
             linewidth=2.5, label="Actual (t → t+1)")
 
@@ -277,10 +292,8 @@ def plot_backtest_error(df, ticker):
 
     ax.text(x_t, close_t + price_offset, f"{close_t:.2f}",
             ha="center", va="bottom", fontsize=18, color="black")
-
     ax.text(x_t + 1 + dx, pred_t1, f"Pred {pred_t1:.2f}",
             ha="left", va="center", fontsize=16, color="red")
-
     ax.text(x_t + 1 + dx, actual_t1, f"Actual {actual_t1:.2f}",
             ha="left", va="center", fontsize=16, color="green")
 
@@ -321,17 +334,19 @@ def plot_backtest_error(df, ticker):
 
 # ================= Main =================
 if __name__ == "__main__":
-    # ✅ 改成南亞科
-    TICKER = "2408.TW"   # 南亞科
+    # ✅ 南亞科
+    TICKER = "2408.TW"
     LOOKBACK = 40
     STEPS = 5
+
+    os.makedirs("results", exist_ok=True)
+    MODEL_PATH = f"results/{TICKER}_model.keras"
 
     df = load_df_from_firestore(TICKER, days=500)
     df = ensure_today_row(df)
     df = add_features(df)
 
     FEATURES = ["Close", "Volume", "RSI", "MACD", "K", "D", "ATR_14"]
-
     df = df.dropna()
 
     X, y_ret, y_dir, idx = create_sequences(df, FEATURES, steps=STEPS, window=LOOKBACK)
@@ -347,6 +362,7 @@ if __name__ == "__main__":
     y_dir_tr, y_dir_te = y_dir[:split], y_dir[split:]
     idx_tr, idx_te = idx[:split], idx[split:]
 
+    # ✅ scaler.fit 僅用 train 區間（避免 leakage）
     train_end_date = pd.Timestamp(idx_tr[-1])
     df_for_scaler = df.loc[:train_end_date, FEATURES].copy()
 
@@ -363,12 +379,31 @@ if __name__ == "__main__":
     X_tr_s = scale_X(X_tr)
     X_te_s = scale_X(X_te)
 
-    model = build_attention_lstm(
-        (LOOKBACK, len(FEATURES)),
-        STEPS,
-        max_daily_logret=0.06  # ✅ 先不改；若太保守可調 0.08，若亂噴可調 0.05
-    )
+    # ✅ A) max_daily_logret 自動化（train |logret| 99% 分位）
+    train_close = df.loc[:train_end_date, "Close"].astype(float)
+    train_logret_abs = np.log(train_close).diff().dropna().abs()
 
+    auto_cap = float(train_logret_abs.quantile(0.99))
+    auto_cap = float(np.clip(auto_cap, 0.03, 0.10))
+    print(f"✅ max_daily_logret auto (99% quantile, clipped): {auto_cap:.4f}")
+
+    # ✅ B) 方向更準：direction weight 拉高
+    DIRECTION_WEIGHT = 0.8
+
+    # ✅ C) 不要每天從頭訓練：載入續訓（更穩、更容易讓方向準）
+    if os.path.exists(MODEL_PATH):
+        print(f"✅ Load existing model: {MODEL_PATH}")
+        # 你有 Lambda 層，TensorFlow 需要 safe_mode=False
+        model = load_model(MODEL_PATH, safe_mode=False)
+
+        # 重新 compile：把方向權重與 learning rate 調成「偏方向」且較穩的 fine-tune
+        model = compile_model(model, direction_weight=DIRECTION_WEIGHT, lr=3e-4)
+    else:
+        print("✅ Build new model")
+        model = build_attention_lstm((LOOKBACK, len(FEATURES)), STEPS, max_daily_logret=auto_cap)
+        model = compile_model(model, direction_weight=DIRECTION_WEIGHT, lr=7e-4)
+
+    # 訓練
     model.fit(
         X_tr_s,
         {"return": y_ret_tr, "direction": y_dir_tr},
@@ -378,8 +413,13 @@ if __name__ == "__main__":
         callbacks=[EarlyStopping(patience=10, restore_best_weights=True)]
     )
 
+    # ✅ 訓練完存檔：明天就能續訓（通常更準、更穩）
+    model.save(MODEL_PATH)
+    print(f"💾 Model saved: {MODEL_PATH}")
+
+    # 預測
     pred_ret, pred_dir = model.predict(X_te_s, verbose=0)
-    raw_returns = pred_ret[-1]
+    raw_returns = pred_ret[-1]  # 已限幅
 
     print(f"📈 {TICKER} 預測方向機率（看漲）: {pred_dir[-1][0]:.2%}")
 
@@ -408,9 +448,11 @@ if __name__ == "__main__":
         periods=STEPS
     )
 
-    os.makedirs("results", exist_ok=True)
-    future_df.to_csv(f"results/{datetime.now():%Y-%m-%d}_{TICKER}_forecast.csv",
-                     index=False, encoding="utf-8-sig")
+    future_df.to_csv(
+        f"results/{datetime.now():%Y-%m-%d}_{TICKER}_forecast.csv",
+        index=False,
+        encoding="utf-8-sig"
+    )
 
     plot_and_save(df, future_df, TICKER)
     plot_backtest_error(df, TICKER)
