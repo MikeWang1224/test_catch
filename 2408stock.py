@@ -1,29 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-FireBase_Attention_LSTM_Direction.py (2408.TW 南亞科｜方向更準版)
-- Attention-LSTM
-- Multi-task: Return path + Direction
-- ✅ 小資料友善版：更穩、更不容易亂噴
-  1) LOOKBACK=40, STEPS=5
-  2) LSTM + Attention pooling（參數比 Transformer 更適合小資料）
-  3) ✅ Return head 加 tanh 限幅（避免預測爆炸）
-  4) ✅ Volume 做 log1p（小資料更穩）
+FireBase_Attention_LSTM_Direction.py (2408.TW 南亞科｜方向更準版 + 更穩版)
 
-✅ 防資料洩漏：
-  - create_sequences 回傳每個樣本對應日期 idx
-  - split 用樣本數切，scaler.fit 只用 train 區間 df 特徵
+你要的「模型端」重點改動（最少但最有感）：
+1) ✅ 加入時間序 validation（EarlyStopping 監看 val_loss，不再假穩）
+2) ✅ direction 改用 Focal loss（或 TF 不支援時 fallback 成加權 BCE）
+3) ✅ direction head 與 return head 對齊：把「sum(raw_returns)」加到方向 logit（避免一個說漲一個說跌）
+4) ✅ scaler 存檔/載入（續訓不再每天換座標系）
+5) ✅ cap 寫入 meta.json：續訓時沿用同一個 cap（避免模型圖裡 cap 固定卻以為更新了）
 
-✅ 輸出檔名加 ticker（避免覆蓋）：
-  - results/YYYY-MM-DD_<TICKER>_pred.png
-  - results/YYYY-MM-DD_<TICKER>_forecast.csv
-  - results/YYYY-MM-DD_<TICKER>_backtest.png
-  - results/YYYY-MM-DD_<TICKER>_backtest.csv
-
-✅ 本次「方向更準」重點改動：
-  A) max_daily_logret 自動化：train |logret| 的 99% 分位 + clip [0.03, 0.10]
-  B) direction loss weight：0.8（更偏方向）
-  C) ✅ 加入「模型存檔 / 載入續訓」：避免每天從頭訓練造成結果飄（通常方向更穩、更準）
-  D) 加 seed：結果更可比較
+⚠️ 圖表與輸出檔名規則不變（你的 results/xxxx 檔案格式維持原樣）
 """
 
 import os, json, random
@@ -34,6 +20,7 @@ import matplotlib.pyplot as plt
 from pandas.tseries.offsets import BDay
 
 from sklearn.preprocessing import MinMaxScaler
+import joblib  # ✅ scaler persistence
 
 import tensorflow as tf
 from tensorflow.keras.models import Model, load_model
@@ -132,8 +119,27 @@ def create_sequences(df, features, steps=5, window=40):
 
     return np.array(X), np.array(y_ret), np.array(y_dir), np.array(idx)
 
-# ================= Model build（return 限幅） =================
-def build_attention_lstm(input_shape, steps, max_daily_logret=0.06):
+# ================= Loss（direction 用 focal；不支援就 fallback） =================
+def get_direction_loss():
+    # TF 版本不同：有些有 BinaryFocalCrossentropy
+    if hasattr(tf.keras.losses, "BinaryFocalCrossentropy"):
+        return tf.keras.losses.BinaryFocalCrossentropy(gamma=2.0)
+    # fallback：加權 BCE（簡單穩）
+    def weighted_bce(y_true, y_pred, pos_weight=1.5):
+        # y_true, y_pred shape: (batch, 1)
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.clip_by_value(tf.cast(y_pred, tf.float32), 1e-7, 1.0 - 1e-7)
+        bce = -(y_true * tf.math.log(y_pred) + (1.0 - y_true) * tf.math.log(1.0 - y_pred))
+        w = y_true * pos_weight + (1.0 - y_true) * 1.0
+        return tf.reduce_mean(w * bce)
+    return weighted_bce
+
+# ================= Model build（return 限幅 + 方向與return對齊） =================
+def build_attention_lstm(input_shape, steps, max_daily_logret=0.06, dir_from_ret_weight=2.0):
+    """
+    dir_from_ret_weight：方向 logit 會加上 sum(raw_returns)*weight
+    - weight 越大，方向越貼近「預測報酬加總」
+    """
     inp = Input(shape=input_shape)
 
     x = LSTM(64, return_sequences=True)(inp)
@@ -144,10 +150,15 @@ def build_attention_lstm(input_shape, steps, max_daily_logret=0.06):
     context = Lambda(lambda t: tf.reduce_sum(t[0] * t[1], axis=1),
                      name="attn_context")([x, weights])
 
-    raw = Dense(steps, activation="tanh")(context)
+    # return head
+    raw = Dense(steps, activation="tanh", name="raw_returns")(context)  # (B, steps)
     out_ret = Lambda(lambda t: t * max_daily_logret, name="return")(raw)
 
-    out_dir = Dense(1, activation="sigmoid", name="direction")(context)
+    # ✅ direction head：context 的 logit + 「sum(raw_returns)」的 logit（讓兩頭一致）
+    base_logit = Dense(1, activation=None, name="dir_base_logit")(context)  # (B,1)
+    sum_raw = Lambda(lambda r: tf.reduce_sum(r, axis=1, keepdims=True), name="sum_raw")(raw)  # (B,1)
+    dir_logit = Lambda(lambda t: t[0] + dir_from_ret_weight * t[1], name="dir_logit")([base_logit, sum_raw])
+    out_dir = Lambda(lambda z: tf.sigmoid(z), name="direction")(dir_logit)
 
     model = Model(inp, [out_ret, out_dir])
     return model
@@ -157,7 +168,7 @@ def compile_model(model, direction_weight=0.8, lr=7e-4):
         optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
         loss={
             "return": tf.keras.losses.Huber(),
-            "direction": "binary_crossentropy"
+            "direction": get_direction_loss()
         },
         loss_weights={
             "return": 1.0,
@@ -340,7 +351,9 @@ if __name__ == "__main__":
     STEPS = 5
 
     os.makedirs("results", exist_ok=True)
-    MODEL_PATH = f"results/{TICKER}_model.keras"
+    MODEL_PATH  = f"results/{TICKER}_model.keras"
+    SCALER_PATH = f"results/{TICKER}_scaler.pkl"
+    META_PATH   = f"results/{TICKER}_meta.json"
 
     df = load_df_from_firestore(TICKER, days=500)
     df = ensure_today_row(df)
@@ -362,15 +375,21 @@ if __name__ == "__main__":
     y_dir_tr, y_dir_te = y_dir[:split], y_dir[split:]
     idx_tr, idx_te = idx[:split], idx[split:]
 
-    # ✅ scaler.fit 僅用 train 區間（避免 leakage）
+    # ✅ scaler.fit 僅用 train 區間（避免 leakage）；但 scaler 要「存檔/載入」讓續訓不漂
     train_end_date = pd.Timestamp(idx_tr[-1])
     df_for_scaler = df.loc[:train_end_date, FEATURES].copy()
 
     if len(df_for_scaler) < LOOKBACK + 5:
         raise ValueError("⚠️ train 區間太短，無法穩定 fit scaler。請確認資料量或調整 LOOKBACK。")
 
-    sx = MinMaxScaler()
-    sx.fit(df_for_scaler.values)
+    if os.path.exists(SCALER_PATH):
+        sx = joblib.load(SCALER_PATH)
+        print(f"✅ Load scaler: {SCALER_PATH}")
+    else:
+        sx = MinMaxScaler()
+        sx.fit(df_for_scaler.values)
+        joblib.dump(sx, SCALER_PATH)
+        print(f"💾 Scaler saved: {SCALER_PATH}")
 
     def scale_X(Xb):
         n, t, f = Xb.shape
@@ -387,30 +406,73 @@ if __name__ == "__main__":
     auto_cap = float(np.clip(auto_cap, 0.03, 0.10))
     print(f"✅ max_daily_logret auto (99% quantile, clipped): {auto_cap:.4f}")
 
+    # ✅ meta：cap 要固定，避免「你以為更新了，但模型圖裡沒更新」
+    meta = {}
+    if os.path.exists(META_PATH):
+        try:
+            with open(META_PATH, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            meta = {}
+
+    if "cap" in meta:
+        cap_used = float(meta["cap"])
+        if abs(cap_used - auto_cap) > 1e-6:
+            print(f"⚠️ cap 已固定沿用 meta cap={cap_used:.4f}（auto_cap={auto_cap:.4f} 不套用）")
+    else:
+        cap_used = auto_cap
+        meta = {
+            "ticker": TICKER,
+            "lookback": LOOKBACK,
+            "steps": STEPS,
+            "features": FEATURES,
+            "cap": cap_used,
+            "created_at_tw": f"{now_tw:%Y-%m-%d %H:%M:%S}"
+        }
+        with open(META_PATH, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        print(f"💾 Meta saved: {META_PATH} (cap={cap_used:.4f})")
+
     # ✅ B) 方向更準：direction weight 拉高
     DIRECTION_WEIGHT = 0.8
+
+    # ✅ validation：取 train 的最後 10% 當 val（時間序，不 shuffle）
+    n_tr = len(X_tr_s)
+    val_cut = int(n_tr * 0.90)
+    if val_cut < 10:
+        raise ValueError("⚠️ train 太少，無法切 val。請增加資料或降低 LOOKBACK/STEPS。")
+
+    X_fit, X_val = X_tr_s[:val_cut], X_tr_s[val_cut:]
+    y_ret_fit, y_ret_val = y_ret_tr[:val_cut], y_ret_tr[val_cut:]
+    y_dir_fit, y_dir_val = y_dir_tr[:val_cut], y_dir_tr[val_cut:]
+
+    print(f"✅ Fit samples: {len(X_fit)} | Val samples: {len(X_val)}")
 
     # ✅ C) 不要每天從頭訓練：載入續訓（更穩、更容易讓方向準）
     if os.path.exists(MODEL_PATH):
         print(f"✅ Load existing model: {MODEL_PATH}")
-        # 你有 Lambda 層，TensorFlow 需要 safe_mode=False
         model = load_model(MODEL_PATH, safe_mode=False)
-
-        # 重新 compile：把方向權重與 learning rate 調成「偏方向」且較穩的 fine-tune
+        # 重新 compile：偏方向 + fine-tune LR
         model = compile_model(model, direction_weight=DIRECTION_WEIGHT, lr=3e-4)
     else:
         print("✅ Build new model")
-        model = build_attention_lstm((LOOKBACK, len(FEATURES)), STEPS, max_daily_logret=auto_cap)
+        model = build_attention_lstm(
+            (LOOKBACK, len(FEATURES)),
+            STEPS,
+            max_daily_logret=cap_used,
+            dir_from_ret_weight=2.0  # ✅ 方向貼近「未來報酬加總」
+        )
         model = compile_model(model, direction_weight=DIRECTION_WEIGHT, lr=7e-4)
 
-    # 訓練
+    # 訓練（✅ 監控 val_loss）
     model.fit(
-        X_tr_s,
-        {"return": y_ret_tr, "direction": y_dir_tr},
+        X_fit,
+        {"return": y_ret_fit, "direction": y_dir_fit},
+        validation_data=(X_val, {"return": y_ret_val, "direction": y_dir_val}),
         epochs=80,
         batch_size=16,
         verbose=2,
-        callbacks=[EarlyStopping(patience=10, restore_best_weights=True)]
+        callbacks=[EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True)]
     )
 
     # ✅ 訓練完存檔：明天就能續訓（通常更準、更穩）
