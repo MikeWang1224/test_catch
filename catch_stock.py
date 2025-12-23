@@ -5,6 +5,10 @@
 ➕ 加入加權指數 / 電子指數（Close only）
 ➕ 加入南亞科 2408.TW（同方法：覆寫今日 Close → 重算指標 → 寫回）
 ➕ 加入華東 8110.TW（同方法：覆寫今日 Close → 重算指標 → 寫回）
+✅ NEW：加入外生因子（Close only）
+   - SOX（費半）^SOX
+   - MU（美光）MU（美股，日期用該交易日 date）
+   - USD/TWD（匯率）優先嘗試 TWD=X（找不到就換備援代碼）
 不含模型、不含預測、不含繪圖
 """
 
@@ -165,18 +169,53 @@ def save_to_firestore(
     batch.commit()
     print(f"🔥 Firestore 寫入完成：{ticker}")
 
-# ---------------- ➕ 指數抓取（Close only） ----------------
+# ---------------- ➕ 指數/外生因子抓取（Close only） ----------------
+def _fetch_history_with_fallback(tickers, period="12mo"):
+    """
+    依序嘗試 tickers，抓到第一個有資料的就回傳 (used_ticker, df)
+    """
+    last_err = None
+    for tk in tickers:
+        try:
+            df = yf.Ticker(tk).history(period=period)
+            if df is not None and len(df) > 0 and "Close" in df.columns:
+                return tk, df
+        except Exception as e:
+            last_err = e
+            continue
+    raise ValueError(f"⚠️ 無法抓取資料：{tickers} | last_err={last_err}")
+
 def save_index_close(ticker: str, alias: str, period: str = "12mo", collection: str = "NEW_stock_data_liteon"):
     if db is None:
         return
 
     df = yf.Ticker(ticker).history(period=period)
+    if df is None or len(df) == 0:
+        print(f"⚠️ 指數/因子無資料：{ticker}（略過 {alias}）")
+        return
+
     for idx, row in df.iterrows():
-        date_str = idx.strftime("%Y-%m-%d")
+        date_str = pd.Timestamp(idx).strftime("%Y-%m-%d")
         doc_ref = db.collection(collection).document(date_str)
         doc_ref.set({alias: {"Close": float(row["Close"])}}, merge=True)
 
-    print(f"🔥 指數寫入完成：{alias}")
+    print(f"🔥 指數/因子寫入完成：{alias}")
+
+def save_factor_close_with_fallback(tickers, alias: str, period: str = "12mo", collection: str = "NEW_stock_data_liteon"):
+    """
+    與 save_index_close 相同（Close only），但支援 ticker 備援。
+    """
+    if db is None:
+        return
+
+    used, df = _fetch_history_with_fallback(tickers, period=period)
+
+    for idx, row in df.iterrows():
+        date_str = pd.Timestamp(idx).strftime("%Y-%m-%d")
+        doc_ref = db.collection(collection).document(date_str)
+        doc_ref.set({alias: {"Close": float(row["Close"])}}, merge=True)
+
+    print(f"🔥 指數/因子寫入完成：{alias}（來源：{used}）")
 
 # ---------------- Main ----------------
 if __name__ == "__main__":
@@ -195,9 +234,25 @@ if __name__ == "__main__":
     df_8110 = fetch_prepare_recalc("8110.TW", period=PERIOD, collection=COLLECTION)
     save_to_firestore(df_8110, "8110.TW", collection=COLLECTION)
 
-    # ➕ 加權指數 / 電子指數
+    # ➕ 加權指數 / 電子指數（Close only）
     save_index_close("^TWII", "TAIEX", period=PERIOD, collection=COLLECTION)
     save_index_close("^TWTE", "ELECTRONICS", period=PERIOD, collection=COLLECTION)
+
+    # ✅ NEW：外生因子（Close only）
+    # 1) 費半 SOX
+    save_index_close("^SOX", "SOX", period=PERIOD, collection=COLLECTION)
+
+    # 2) 美光 MU（美股）
+    save_index_close("MU", "MU_US", period=PERIOD, collection=COLLECTION)
+
+    # 3) USD/TWD（匯率）— yfinance 代碼可能因地區/資料源不同，做備援
+    #    常見：TWD=X（表示 1 USD 換多少 TWD）
+    save_factor_close_with_fallback(
+        tickers=["TWD=X", "USDTWD=X", "USD/TWD", "USDTWD"],
+        alias="USD_TWD",
+        period=PERIOD,
+        collection=COLLECTION,
+    )
 
     print("2301 tail:\n", df_2301.tail())
     print("2408 tail:\n", df_2408.tail())
