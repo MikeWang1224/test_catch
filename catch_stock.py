@@ -6,8 +6,8 @@
 ➕ 加入南亞科 2408.TW（同方法：覆寫今日 Close → 重算指標 → 寫回）
 ➕ 加入華東 8110.TW（同方法：覆寫今日 Close → 重算指標 → 寫回）
 ✅ NEW：加入外生因子（Close only）
-   - SOX（費半）^SOX
-   - MU（美光）MU（美股，日期用該交易日 date）
+   - SOX（費半）^SOX（抓不到則 fallback SOXX/SMH）
+   - MU（美光）MU（抓不到則 fallback MU.VI / MU.MX）
    - USD/TWD（匯率）優先嘗試 TWD=X（找不到就換備援代碼）
 不含模型、不含預測、不含繪圖
 """
@@ -110,10 +110,6 @@ def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 # ---------------- Firestore 覆寫今日 Close ----------------
 def overwrite_today_close(df: pd.DataFrame, ticker: str, collection: str = "NEW_stock_data_liteon") -> pd.DataFrame:
-    """
-    會去 Firestore 的 collection / 今日文件讀取 payload[ticker]["Close"]，
-    若存在且 df.index 有今日，則覆寫 Close 後回傳（之後再重算指標）
-    """
     if db is None:
         return df
 
@@ -140,11 +136,7 @@ def fetch_prepare_recalc(ticker: str = "2301.TW", period: str = "12mo", collecti
     return df
 
 # ---------------- Firestore 寫個股 ----------------
-def save_to_firestore(
-    df: pd.DataFrame,
-    ticker: str = "2301.TW",
-    collection: str = "NEW_stock_data_liteon",
-):
+def save_to_firestore(df: pd.DataFrame, ticker: str = "2301.TW", collection: str = "NEW_stock_data_liteon"):
     if db is None:
         return
 
@@ -171,9 +163,6 @@ def save_to_firestore(
 
 # ---------------- ➕ 指數/外生因子抓取（Close only） ----------------
 def _fetch_history_with_fallback(tickers, period="12mo"):
-    """
-    依序嘗試 tickers，抓到第一個有資料的就回傳 (used_ticker, df)
-    """
     last_err = None
     for tk in tickers:
         try:
@@ -202,9 +191,6 @@ def save_index_close(ticker: str, alias: str, period: str = "12mo", collection: 
     print(f"🔥 指數/因子寫入完成：{alias}")
 
 def save_factor_close_with_fallback(tickers, alias: str, period: str = "12mo", collection: str = "NEW_stock_data_liteon"):
-    """
-    與 save_index_close 相同（Close only），但支援 ticker 備援。
-    """
     if db is None:
         return
 
@@ -237,8 +223,7 @@ if __name__ == "__main__":
     # ➕ 加權指數（Close only）
     save_index_close("^TWII", "TAIEX", period=PERIOD, collection=COLLECTION)
 
-    # ✅ 修正：電子類指數（Yahoo 不支援 ^TWTE）
-    # 先試 ^TELI（TSEC electronics subindex），不行再試 IR0027.TW
+    # ✅ 電子類指數（先試 ^TELI，不行再 IR0027.TW）
     save_factor_close_with_fallback(
         tickers=["^TELI", "IR0027.TW"],
         alias="ELECTRONICS",
@@ -246,27 +231,24 @@ if __name__ == "__main__":
         collection=COLLECTION,
     )
 
-    # ✅ NEW：外生因子（Close only）
-    # 1) 費半 SOX
-    # 1) 半導體 proxy：先 ^SOX，失敗就用 SOXX 或 SMH
-   save_factor_close_with_fallback(
-       tickers=["^SOX", "SOXX", "SMH"],
-       alias="SOX",
-       period=PERIOD,
-       collection=COLLECTION,
-   )
-   
-   # 2) 美光：先 MU，失敗就用 MU 的其他市場報價（備援通常用不到，但留著不會壞）
-   save_factor_close_with_fallback(
-       tickers=["MU", "MU.VI", "MU.MX"],
-       alias="MU_US",
-       period=PERIOD,
-       collection=COLLECTION,
-   )
-   
+    # ✅ 外生因子（Close only）— 改成 fallback，避免抓不到就整段沒資料
+    # 1) 半導體 proxy：^SOX → SOXX → SMH
+    save_factor_close_with_fallback(
+        tickers=["^SOX", "SOXX", "SMH"],
+        alias="SOX",
+        period=PERIOD,
+        collection=COLLECTION,
+    )
 
-    # 3) USD/TWD（匯率）— yfinance 代碼可能因地區/資料源不同，做備援
-    #    常見：TWD=X（表示 1 USD 換多少 TWD）
+    # 2) 美光：MU → MU.VI → MU.MX
+    save_factor_close_with_fallback(
+        tickers=["MU", "MU.VI", "MU.MX"],
+        alias="MU_US",
+        period=PERIOD,
+        collection=COLLECTION,
+    )
+
+    # 3) USD/TWD（匯率）
     save_factor_close_with_fallback(
         tickers=["TWD=X", "USDTWD=X", "USD/TWD", "USDTWD"],
         alias="USD_TWD",
