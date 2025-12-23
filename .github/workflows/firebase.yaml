@@ -1,4 +1,4 @@
-name: Run Stock Programs (Liteon + Nanya)
+name: Run Stock Programs (Liteon + Nanya + Huatung)
 
 on:
   push:
@@ -58,6 +58,13 @@ jobs:
           FIREBASE: ${{ secrets.FIREBASE }}
         run: |
           python 2408stock.py
+
+      # ---------------- 再跑 LSTM / 預測 / 繪圖：華東 ----------------
+      - name: Run stock prediction program (Huatung - 8110stock.py)
+        env:
+          FIREBASE: ${{ secrets.FIREBASE }}
+        run: |
+          python 8110stock.py
 
       # ---------------- 讓 HTML 一定更新（關鍵） ----------------
       - name: Update build time in index.html
