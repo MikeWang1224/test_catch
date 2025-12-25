@@ -404,10 +404,13 @@ def forecast_6m_trend_index(
         X_win = scaler.transform(X_win).reshape(1, lookback, len(features))
 
         # 🔑 只用 direction head
-        _, dir_prob = model.predict(X_win, verbose=0)
-        p = float(dir_prob[0][0])   # 看漲機率
+        pred_ret, dir_prob = model.predict(X_win, verbose=0)
 
-        trend_vals.append(p - 0.5)
+        p = float(dir_prob[0][0])
+        energy = float(np.mean(np.abs(pred_ret[0])))   # normalized return 能量
+        
+        trend_vals.append((p - 0.5) * energy)
+
         next_date = df_ext.index[-1] + BDay(1)
         dates.append(next_date)
 
