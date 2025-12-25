@@ -371,6 +371,108 @@ def plot_backtest_error(df, ticker: str):
     out_csv = f"results/{today:%Y-%m-%d}_{ticker}_backtest.csv"
     bt.to_csv(out_csv, index=False, encoding="utf-8-sig")
 
+
+# ================= 6M Trend Forecast（只新增，不影響原流程） =================
+def forecast_6m_trend(
+    model,
+    df,
+    features,
+    scaler,
+    lookback,
+    steps,
+    ticker,
+    months=6
+):
+    """
+    使用 recursive forecast 預測未來 6 個月趨勢
+    x 軸：月
+    y 軸：股價
+    """
+
+    # 約略 1 個月 21 個交易日
+    total_days = int(months * 21)
+
+    df_ext = df.copy()
+    asof_date = df_ext.index.max()
+
+    closes = df_ext["Close"].astype(float).tolist()
+
+    preds = []
+    dates = []
+
+    i = 0
+    while i < total_days:
+        # 取最後 lookback 天
+        window_df = df_ext.iloc[-lookback:].copy()
+
+        # scale X
+        X_win = window_df[features].values
+        X_win = scaler.transform(X_win).reshape(1, lookback, len(features))
+
+        pred_ret, _ = model.predict(X_win, verbose=0)
+        norm_rets = pred_ret[0]
+
+        # 取 asof 的波動尺度
+        scale = float(df_ext["RET_STD_20"].iloc[-1])
+        scale = max(scale, 1e-6)
+
+        for r_norm in norm_rets:
+            if i >= total_days:
+                break
+
+            r = float(r_norm) * scale
+            next_price = closes[-1] * np.exp(r)
+
+            next_date = df_ext.index[-1] + BDay(1)
+
+            closes.append(next_price)
+            preds.append(next_price)
+            dates.append(next_date)
+
+            # 建立一筆「假的未來列」供下一輪用
+            new_row = df_ext.iloc[-1].copy()
+            new_row.name = next_date
+            new_row["Close"] = next_price
+            df_ext = pd.concat([df_ext, new_row.to_frame().T])
+
+            i += 1
+
+    trend_df = pd.DataFrame({
+        "date": dates,
+        "Pred_Close": preds
+    })
+
+    # ===== 月資料（x 軸用）=====
+    trend_df["month"] = trend_df["date"].dt.to_period("M").dt.to_timestamp()
+    monthly = trend_df.groupby("month").last().reset_index()
+
+    # ===== 存 CSV =====
+    os.makedirs("results", exist_ok=True)
+    out_csv = f"results/{datetime.now():%Y-%m-%d}_{ticker}_6m_trend.csv"
+    monthly.to_csv(out_csv, index=False, encoding="utf-8-sig")
+
+    # ===== 畫圖 =====
+    plt.figure(figsize=(14, 6))
+    plt.plot(
+        monthly["month"].dt.strftime("%Y-%m"),
+        monthly["Pred_Close"],
+        marker="o",
+        linewidth=2
+    )
+
+    plt.title(f"{ticker} 6-Month Price Trend (Monthly)")
+    plt.xlabel("Month")
+    plt.ylabel("Price")
+    plt.grid(alpha=0.3)
+    plt.xticks(rotation=45)
+
+    out_png = f"results/{datetime.now():%Y-%m-%d}_{ticker}_6m_trend.png"
+    plt.savefig(out_png, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    print(f"📈 已輸出 6 個月趨勢圖：{out_png}")
+
+
 # ================= Main =================
 if __name__ == "__main__":
     TICKER = "8110.TW"
@@ -527,3 +629,15 @@ if __name__ == "__main__":
     # ✅ 圖輸出（內容不動、檔名改含 ticker）
     plot_and_save(df, future_df, ticker=TICKER)
     plot_backtest_error(df, ticker=TICKER)
+    # ===== 6 個月趨勢（只新增）=====
+    forecast_6m_trend(
+        model=model,
+        df=df,
+        features=FEATURES,
+        scaler=sx,
+        lookback=LOOKBACK,
+        steps=STEPS,
+        ticker=TICKER,
+        months=6
+    )
+    
