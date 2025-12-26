@@ -504,8 +504,10 @@ def plot_6m_trend_advanced(
     # =============================
     # 6️⃣ 區間帶（ATR-based fan）
     # =============================
-    upper = prices * (1 + 1.2 * base_amp)
-    lower = prices * (1 - 1.2 * base_amp)
+    time_scale = np.linspace(0.6, 1.3, len(prices))
+    upper = prices * (1 + base_amp * time_scale)
+    lower = prices * (1 - base_amp * time_scale)
+
 
     # =============================
     # 7️⃣ X 軸（月）
