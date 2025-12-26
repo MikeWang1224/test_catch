@@ -1,3 +1,6 @@
+#8110stock 
+
+
 # -*- coding: utf-8 -*-
 """
 FireBase_Attention_LSTM_Direction.py  (8110stock.py)
@@ -431,8 +434,7 @@ def plot_6m_trend_advanced(
     daily_drift *= trend_score
 
       
-    decay = np.exp(-np.linspace(0, 1.2, MONTHS))  # 1.0 → ~0.3
-    monthly_logret = daily_drift * DPM * decay
+    monthly_logret = daily_drift * DPM
     
     trend = []
     p = last_close
@@ -497,16 +499,15 @@ def plot_6m_trend_advanced(
         cycle_main = base_amp * np.sin(phase_p)
         cycle_pull = 0.6 * base_amp * np.sin(phase_v + np.pi)
 
-        price = float(trend[m - 1] * (1 + cycle_main + cycle_pull))
+        price = trend[m - 1] * (1 + cycle_main + cycle_pull)
         prices.append(price)
-
 
     prices = np.array(prices)
 
     # =============================
     # 6️⃣ 區間帶（ATR-based fan）
     # =============================
-    time_scale = np.linspace(0.8, 1.6, len(prices))
+    time_scale = np.linspace(0.6, 1.3, len(prices))
     upper = prices * (1 + base_amp * time_scale)
     lower = prices * (1 - base_amp * time_scale)
 
