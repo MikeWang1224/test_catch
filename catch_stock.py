@@ -20,7 +20,7 @@ from datetime import datetime
 WRITE_DAYS = 3
 COLLECTION = "NEW_stock_data_liteon"
 PERIOD = "12mo"
-INIT_CHECK_TICKER = "2301.TW"   # 用來判斷是否初始化
+INIT_CHECK_TICKER = "2301.TW"   # 用來判斷是否初始化（主股票即可）
 
 # ================= Firebase 初始化 =================
 key_dict = json.loads(os.environ.get("FIREBASE", "{}"))
@@ -44,16 +44,10 @@ def is_init_mode(ticker: str) -> bool:
     if db is None:
         return False
 
-    docs = (
-        db.collection(COLLECTION)
-        .limit(1)
-        .stream()
-    )
-
+    docs = db.collection(COLLECTION).limit(1).stream()
     for doc in docs:
         if ticker in doc.to_dict():
             return False
-
     return True
 
 # ================= 交易日工具 =================
@@ -105,10 +99,11 @@ def overwrite_last_close(df, ticker):
     if db is None or df is None or len(df) == 0:
         return df
 
-    last_day, is_today_trading = get_last_trading_day(df)
-    date_str = last_day.strftime("%Y-%m-%d")
+    last_day, _ = get_last_trading_day(df)
+    doc = db.collection(COLLECTION).document(
+        last_day.strftime("%Y-%m-%d")
+    ).get()
 
-    doc = db.collection(COLLECTION).document(date_str).get()
     if doc.exists:
         payload = doc.to_dict().get(ticker, {})
         if "Close" in payload:
@@ -172,7 +167,6 @@ def save_factor_latest(tickers, alias):
             ).set({
                 alias: {"Close": float(row["Close"])}
             }, merge=True)
-
             return
         except Exception:
             continue
@@ -187,7 +181,13 @@ if __name__ == "__main__":
     else:
         print("🔁 一般更新模式（只寫最近資料）")
 
-    for ticker in ["2301.TW", "2408.TW", "8110.TW"]:
+    # ✅ 個股（已包含 群創 3481.TW）
+    for ticker in [
+        "2301.TW",  # 光寶科
+        "2408.TW",  # 南亞科
+        "8110.TW",  # 華東
+        "3481.TW",  # 群創 ✅
+    ]:
         df = fetch_prepare_recalc(ticker)
         save_stock(df, ticker, init_mode=INIT_MODE)
 
